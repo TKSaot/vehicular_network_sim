@@ -1,0 +1,13 @@
+{
+  "outdir": "outputs",
+  "text_file": "examples/sample_text.txt",
+  "mod": "QPSK",
+  "snr_db": 8,
+  "channel": "rayleigh",
+  "coding": "hamming74",
+  "interleaver": true,
+
+  "time_selective": true,
+  "fading_model": "block",
+  "coherence_symbols": 64
+}
