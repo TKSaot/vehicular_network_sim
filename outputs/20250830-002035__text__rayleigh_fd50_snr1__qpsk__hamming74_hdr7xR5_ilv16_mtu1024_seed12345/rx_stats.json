@@ -1,0 +1,10 @@
+{
+  "frames": 8,
+  "bad_frames": 1,
+  "all_crc_ok": false,
+  "app_header_crc_ok": true,
+  "app_header_recovered_via_majority": false,
+  "app_header_used_mode": "valid",
+  "cer_approx": 0.7571428571428571,
+  "output_text": "outputs/20250830-002035__text__rayleigh_fd50_snr1__qpsk__hamming74_hdr7xR5_ilv16_mtu1024_seed12345/received_text.txt"
+}

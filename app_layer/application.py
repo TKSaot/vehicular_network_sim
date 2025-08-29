@@ -1,97 +1,167 @@
-import io, json
-from typing import Tuple
+# app_layer/application.py
+"""
+Application-layer serializers for different modalities:
+- text (.txt, UTF-8 by default)
+- edge (binary image, PNG)
+- depth (grayscale image, PNG)
+- segmentation (RGB image, PNG)
+
+We serialize *content*, not raw file bytes, to avoid container metadata corruption.
+Images are loaded via Pillow into numpy arrays; text is handled as Unicode strings.
+The application header encodes what is needed to reconstruct content at the receiver.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Literal
+import numpy as np
 from PIL import Image
 
-# 2B magic | 2B hlen | header-json | body
-def _make_app_header_bytes(magic2: bytes, header_dict: dict) -> bytes:
-    hdr = json.dumps(header_dict, ensure_ascii=False).encode("utf-8")
-    assert len(magic2) == 2
-    hlen = len(hdr).to_bytes(2, 'big')
-    return magic2 + hlen + hdr
+# ----------------- App Header -----------------
+@dataclass
+class AppHeader:
+    version: int
+    modality: Literal["text", "edge", "depth", "segmentation"]
+    height: int = 0
+    width: int = 0
+    channels: int = 0
+    bits_per_sample: int = 8
+    payload_len_bytes: int = 0   # number of data bytes that follow
 
-def _parse_app_payload(payload: bytes) -> Tuple[str, dict, bytes]:
-    if len(payload) < 4:
-        return "", {}, b""
-    magic = payload[0:2].decode(errors="ignore")
-    hlen = int.from_bytes(payload[2:4], 'big')
-    if len(payload) < 4 + hlen:
-        return magic, {}, b""
-    header = json.loads(payload[4:4+hlen].decode("utf-8"))
-    body = payload[4+hlen:]
-    return magic, header, body
+    def to_bytes(self) -> bytes:
+        # Fixed 16-byte header
+        mod_code = {"text":0, "edge":1, "depth":2, "segmentation":3}[self.modality]
+        b = bytearray(16)
+        b[0] = self.version & 0xFF
+        b[1] = mod_code & 0xFF
+        b[2:4] = int(self.height).to_bytes(2, 'big')
+        b[4:6] = int(self.width).to_bytes(2, 'big')
+        b[6] = self.channels & 0xFF
+        b[7] = self.bits_per_sample & 0xFF
+        b[8:12] = int(self.payload_len_bytes).to_bytes(4, 'big')
+        return bytes(b)
 
-# ---------- 非UEP（PNG圧縮ペイロード） ----------
-def prepare_image_payload_png(path: str, resize: int = 128) -> bytes:
-    img = Image.open(path).convert("L")
-    if resize and resize > 0:
-        img = img.resize((resize, resize))
-    bio = io.BytesIO(); img.save(bio, format="PNG")
-    img_bytes = bio.getvalue()
-    header = {"fmt": "PNG", "w": img.width, "h": img.height}
-    return _make_app_header_bytes(b"IM", header) + img_bytes
+    @staticmethod
+    def from_bytes(b: bytes) -> 'AppHeader':
+        if len(b) < 16:
+            raise ValueError(f"AppHeader bytes too short: {len(b)} < 16 (likely header corruption).")
+        version = b[0]
+        code = b[1]
+        mapping = {0:"text",1:"edge",2:"depth",3:"segmentation"}
+        if code not in mapping:
+            raise ValueError(f"Invalid modality code in AppHeader: {code} (likely header CRC failure / severe channel errors).")
+        modality = mapping[code]
+        height = int.from_bytes(b[2:4], 'big')
+        width  = int.from_bytes(b[4:6], 'big')
+        channels = b[6]
+        bps = b[7]
+        payload_len = int.from_bytes(b[8:12], 'big')
+        return AppHeader(version=version, modality=modality, height=height, width=width,
+                         channels=channels, bits_per_sample=bps, payload_len_bytes=payload_len)
 
-def parse_image_payload_png(payload: bytes, out_path: str) -> None:
-    magic, header, body = _parse_app_payload(payload)
-    if magic != "IM" or header.get("fmt") != "PNG":
-        raise ValueError("Not a PNG payload")
-    with open(out_path, "wb") as f:
-        f.write(body)
+# ----------------- Serialization -----------------
+def load_text_as_bytes(path: str, encoding: str="utf-8") -> bytes:
+    with open(path, "r", encoding=encoding) as f:
+        txt = f.read()
+    return txt.encode(encoding)
 
-# ---------- UEP：タイプ別RAW生成（resize<=0 なら元サイズ保持） ----------
-def prepare_image_header_and_body_raw(path: str, resize: int, kind: str) -> Tuple[bytes, bytes]:
-    kind = kind.lower()
-    if kind == "seg":
-        img = Image.open(path).convert("RGB")
+def text_bytes_to_string(b: bytes, encoding: str="utf-8", errors: str="replace") -> str:
+    return b.decode(encoding, errors=errors)
+
+def load_image_to_array(path: str, modality: str, validate_mode: bool = True) -> np.ndarray:
+    im = Image.open(path)
+    if modality == "edge":
+        if validate_mode and im.mode not in ("L","1"):
+            im = im.convert("L")
+        arr = np.array(im)
+        if arr.ndim == 3:
+            arr = np.array(im.convert("L"))
+        arr = (arr >= 128).astype(np.uint8) * 255
+        return arr
+    elif modality == "depth":
+        if validate_mode and im.mode != "L":
+            im = im.convert("L")
+        arr = np.array(im)
+        return arr.astype(np.uint8)
+    elif modality == "segmentation":
+        if validate_mode and im.mode != "RGB":
+            im = im.convert("RGB")
+        arr = np.array(im)
+        return arr.astype(np.uint8)
     else:
-        img = Image.open(path).convert("L")
-    if resize and resize > 0:
-        img = img.resize((resize, resize))
+        raise ValueError("Unsupported modality for image")
 
-    if kind == "depth":
-        raw = img.tobytes()
-        header = {"fmt": "RAW8_GRAY", "w": img.width, "h": img.height, "kind": "depth", "channels": 1}
-        return _make_app_header_bytes(b"IM", header), raw
+def serialize_content(modality: str, content_path: str, text_encoding: str="utf-8", validate_image_mode: bool=True) -> tuple[AppHeader, bytes]:
+    if modality == "text":
+        data = load_text_as_bytes(content_path, encoding=text_encoding)
+        hdr = AppHeader(version=1, modality="text", height=0, width=0, channels=0,
+                        bits_per_sample=8, payload_len_bytes=len(data))
+        return hdr, data
 
-    if kind == "edge":
-        img = img.point(lambda p: 255 if p >= 128 else 0, mode="L")
-        raw = img.tobytes()
-        header = {"fmt": "RAW8_EDGE", "w": img.width, "h": img.height, "kind": "edge", "channels": 1}
-        return _make_app_header_bytes(b"IM", header), raw
+    arr = load_image_to_array(content_path, modality=modality, validate_mode=validate_image_mode)
+    if modality in ("edge","depth"):
+        h, w = arr.shape
+        ch = 1
+        payload = arr.reshape(-1).tobytes()
+    elif modality == "segmentation":
+        h, w, ch = arr.shape
+        payload = arr.reshape(-1).tobytes()
+    else:
+        raise ValueError("Unknown modality")
 
-    if kind == "seg":
-        raw = img.tobytes()  # RGB
-        header = {"fmt": "RAW8_RGB", "w": img.width, "h": img.height, "kind": "seg", "channels": 3}
-        return _make_app_header_bytes(b"IM", header), raw
+    hdr = AppHeader(version=1, modality=modality, height=h, width=w, channels=ch,
+                    bits_per_sample=8, payload_len_bytes=len(payload))
+    return hdr, payload
 
-    raise ValueError("Unknown image kind: " + kind)
+def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int, ...]) -> np.ndarray:
+    """
+    Robust reshape:
+    - truncate if too long
+    - zero-pad if too short
+    Always returns a uint8 array with the requested shape.
+    """
+    n_expected = 1
+    for s in shape: n_expected *= s
+    b = np.frombuffer(payload_bytes, dtype=np.uint8, count=min(len(payload_bytes), n_expected))
+    if b.size < n_expected:
+        b = np.pad(b, (0, n_expected - b.size), mode="constant", constant_values=0)
+    else:
+        b = b[:n_expected]
+    return b.reshape(shape)
 
-# ---------- RAW→PIL（PNG保存や後処理に使う） ----------
-def pil_from_raw(fmt: str, w: int, h: int, raw: bytes) -> Image.Image:
-    need = w * h
-    if fmt == "RAW8_GRAY":
-        buf = raw[:need].ljust(need, b"\x00")
-        return Image.frombytes("L", (w, h), buf)
-    if fmt == "RAW8_EDGE":
-        buf = raw[:need].ljust(need, b"\x00")
-        im = Image.frombytes("L", (w, h), buf)
-        return im.point(lambda p: 255 if p >= 128 else 0).convert("1")
-    if fmt == "RAW8_RGB":
-        need_rgb = w * h * 3
-        buf = raw[:need_rgb].ljust(need_rgb, b"\x00")
-        return Image.frombytes("RGB", (w, h), buf)
-    buf = raw[:need].ljust(need, b"\x00")
-    return Image.frombytes("L", (w, h), buf)
+def deserialize_content(hdr: AppHeader, payload_bytes: bytes, text_encoding: str="utf-8", text_errors: str="replace") -> tuple[str, np.ndarray]:
+    """
+    Returns (text_str, image_array). Only one is relevant per modality.
+    Uses robust reshape for images to guarantee output even when payload length mismatches.
+    """
+    if hdr.modality == "text":
+        s = text_bytes_to_string(payload_bytes, encoding=text_encoding, errors=text_errors)
+        return s, np.array([], dtype=np.uint8)
 
-# ---------- テキスト ----------
-def prepare_text_header_and_body(text: str) -> Tuple[bytes, bytes]:
-    by = text.encode("utf-8")
-    header = {"encoding": "utf-8", "nbytes": len(by), "fmt": "TXT"}
-    header_bytes = _make_app_header_bytes(b"TX", header)
-    return header_bytes, by
+    if hdr.modality in ("edge","depth"):
+        arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width))
+        if hdr.modality == "edge":
+            arr = (arr >= 128).astype(np.uint8)*255
+        return "", arr
 
-def parse_text_payload(payload: bytes) -> str:
-    magic, header, body = _parse_app_payload(payload)
-    if magic != "TX":
-        raise ValueError("Not a text payload")
-    enc = header.get("encoding", "utf-8")
-    return body.decode(enc, errors="strict")
+    if hdr.modality == "segmentation":
+        arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width, hdr.channels))
+        return "", arr
+
+    raise ValueError("Unknown modality in header")
+
+def save_output(hdr: AppHeader, text_str: str, img_arr: np.ndarray, out_path: str):
+    if hdr.modality == "text":
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text_str)
+        return
+
+    from PIL import Image
+    if hdr.modality in ("edge","depth"):
+        im = Image.fromarray(img_arr.astype(np.uint8), mode="L")
+        im.save(out_path, format="PNG")
+    elif hdr.modality == "segmentation":
+        im = Image.fromarray(img_arr.astype(np.uint8), mode="RGB")
+        im.save(out_path, format="PNG")
+    else:
+        raise ValueError("Unsupported modality")

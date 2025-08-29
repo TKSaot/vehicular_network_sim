@@ -1,68 +1,62 @@
+# common/config.py
+"""
+Configuration dataclasses for the vehicular network simulation.
+These allow you to customize parameters across the stack.
+"""
+
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
-ModulationScheme = Literal["BPSK", "QPSK", "16QAM"]
-ChannelType = Literal["awgn", "rayleigh", "rician"]
-CodingScheme = Literal["none", "repetition3", "hamming74"]
-ImageKind = Literal["depth", "edge", "seg"]  # 画像タイプ
-
 @dataclass
-class PHYConfig:
-    modulation: ModulationScheme = "QPSK"
-    snr_db: float = 8.0
-    snr_type: Literal["EsN0", "EbN0"] = "EsN0"
-    code_rate_override: Optional[float] = None
-    soft_demapping: bool = False
-
-@dataclass
-class ChannelConfig:
-    channel_type: str = "awgn"
-    rician_K: float = 3.0
-    time_selective: bool = False
-    fading_model: str = "block"   # "block" | "gauss_markov"
-    coherence_symbols: int = 32   # block-fading のブロック長
-    rho: float = 0.95             # gauss_markov の相関
+class AppConfig:
+    # modality: "text" | "edge" | "depth" | "segmentation"
+    modality: Literal["text", "edge", "depth", "segmentation"] = "text"
+    # For images: if True, enforce the expected channel layout per modality
+    validate_image_mode: bool = True
+    # For text decoding robustness: replace undecodable bytes
+    text_encoding: str = "utf-8"
+    text_errors: str = "replace"  # "strict", "ignore", or "replace"
 
 @dataclass
 class LinkConfig:
-    framing: Literal["length_crc32"] = "length_crc32"
-    # 大きめ既定（約 5e6 bit = 625kB）
-    max_frame_bits: int = 5_000_000
-    interleaver: bool = True
-    interleaver_seed: int = 2025
-    coding: CodingScheme = "hamming74"
+    mtu_bytes: int = 1024             # payload bytes per DATA frame (before FEC/interleaving)
+    interleaver_depth: int = 8        # block interleaver depth (>=1). 1 disables interleaving
+    fec_scheme: Literal["none", "repeat", "hamming74", "rs255_223"] = "hamming74"
+    repeat_k: int = 3                 # used if fec_scheme == "repeat"
+    drop_bad_frames: bool = False     # if CRC fails: drop the frame (True) or keep corrupted payload (False)
+
+    # Header robustness
+    strong_header_protection: bool = True  # keep True
+    header_copies: int = 7                 # repeat APP header frames (front) to ensure recovery at low SNR
+    header_rep_k: int = 5                  # repetition factor applied to APP header frames after FEC
+    force_output_on_hdr_fail: bool = True  # if header still fails, force using TX-known header to produce outputs
+
+    verbose: bool = False             # print per-frame logs
 
 @dataclass
-class UEPConfig:
-    enabled: bool = False
-    header_mod: ModulationScheme = "BPSK"
-    header_coding: CodingScheme = "repetition3"
-    header_interleaver: bool = True
-    header_boost_db: float = 6.0
-    header_max_frame_bits: int = 65_536
-    header_repeats: int = 1
+class ModulationConfig:
+    scheme: Literal["bpsk", "qpsk", "16qam"] = "qpsk"
 
 @dataclass
-class AppConfig:
-    app_type: Literal["text", "image"] = "text"
-    text: str = "Hello vehicular world! こんにちは🚗"
-    image_path: str = "examples/sample_image.png"
-    # 0 または負値で元サイズ保持
-    image_resize: int = 128
-    # 保存時の最終サイズ（0 なら送信サイズをそのまま）
-    image_save_size: int = 0
-    image_kind: ImageKind = "depth"
+class ChannelConfig:
+    channel_type: Literal["awgn", "rayleigh"] = "rayleigh"
+    snr_db: float = 10.0                 # Es/N0 in dB
+    seed: Optional[int] = 12345          # RNG seed for reproducibility
+    # Rayleigh-specific (simple time-varying AR(1) fading)
+    doppler_hz: float = 30.0             # nominal Doppler (affects fading correlation)
+    symbol_rate: float = 1e6             # symbols per second (for Doppler correlation)
+    block_fading: bool = False           # if True, h is constant over a frame
 
 @dataclass
-class SimConfig:
-    phy: PHYConfig = field(default_factory=PHYConfig)
-    ch: ChannelConfig = field(default_factory=ChannelConfig)
-    link: LinkConfig = field(default_factory=LinkConfig)
+class PilotConfig:
+    preamble_len: int = 32               # BPSK preamble bits per frame (not used for sync in this sim)
+    pilot_len: int = 16                  # known pilot symbols per frame for channel estimation (QPSK pilots)
+    pilot_every_n_symbols: int = 0       # not used in this simplified sim (set 0 to disable mid-frame pilots)
+
+@dataclass
+class SimulationConfig:
     app: AppConfig = field(default_factory=AppConfig)
-    uep: UEPConfig = field(default_factory=UEPConfig)
-    verbose: bool = True
-
-def ebn0_to_esn0_db(ebn0_db: float, bits_per_sym: int, code_rate: float = 1.0) -> float:
-    """Eb/N0[dB] -> Es/N0[dB]。Es = Eb * (bits_per_sym * code_rate)"""
-    import math
-    return ebn0_db + 10*math.log10(bits_per_sym * code_rate)
+    link: LinkConfig = field(default_factory=LinkConfig)
+    mod: ModulationConfig = field(default_factory=ModulationConfig)
+    chan: ChannelConfig = field(default_factory=ChannelConfig)
+    pilot: PilotConfig = field(default_factory=PilotConfig)

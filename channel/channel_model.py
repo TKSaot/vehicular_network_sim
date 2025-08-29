@@ -1,68 +1,74 @@
+# channel/channel_model.py
+"""
+Channel models: AWGN and Rayleigh fading with optional Doppler correlation.
+We operate on complex baseband symbols.
+"""
+
+from __future__ import annotations
 import numpy as np
-from common.config import ChannelConfig
+from dataclasses import dataclass
 
-class ChannelModel:
-    def __init__(self, cfg: ChannelConfig):
-        self.cfg = cfg
+def awgn_channel(symbols: np.ndarray, snr_db: float, seed: int | None = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    # Es/N0 -> noise variance per complex dimension: N0/2 = Es / (2*SNR_linear)
+    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    snr_lin = 10**(snr_db/10.0)
+    N0 = Es / snr_lin
+    noise_var = N0
+    noise = (rng.normal(0, np.sqrt(noise_var/2), size=symbols.shape) +
+             1j * rng.normal(0, np.sqrt(noise_var/2), size=symbols.shape))
+    return symbols + noise
 
-    def _fading(self, n: int) -> np.ndarray:
-        c = self.cfg
-        ct = c.channel_type.lower()
-        if ct == "awgn":
-            return np.ones(n, dtype=np.complex128)
+def rayleigh_fading(symbols: np.ndarray, snr_db: float, seed: int | None = None,
+                    doppler_hz: float = 30.0, symbol_rate: float = 1e6, block_fading: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply Rayleigh fading h[n] and AWGN. Returns (rx_symbols, h) where h is the complex fade per symbol.
+    If block_fading=True, h is constant over the whole array.
+    Otherwise, AR(1) process is used: h[n] = rho * h[n-1] + sqrt(1-rho^2) * v[n], v ~ CN(0,1)
+    with rho approx J0(2*pi*fd*Ts) ~ exp(- (2*pi*fd*Ts)^2 / 2) for small arguments.
+    """
+    rng = np.random.default_rng(seed)
+    N = len(symbols)
+    if N == 0:
+        return symbols.copy(), np.ones(0, dtype=np.complex128)
 
-        if ct == "rayleigh":
-            if not c.time_selective:
-                h = (np.random.randn()+1j*np.random.randn())/np.sqrt(2)
-                return np.full(n, h, dtype=np.complex128)
-            # time-selective
-            if c.fading_model == "block":
-                L = max(1, int(c.coherence_symbols))
-                blocks = (n+L-1)//L
-                hh = (np.random.randn(blocks)+1j*np.random.randn(blocks))/np.sqrt(2)
-                h = np.repeat(hh, L)[:n]
-                return h.astype(np.complex128)
-            else:  # gauss_markov
-                rho = float(c.rho)
-                w = (np.random.randn(n)+1j*np.random.randn(n))/np.sqrt(2)
-                h = np.zeros(n, dtype=np.complex128)
-                h[0] = w[0]
-                for i in range(1,n):
-                    h[i] = rho*h[i-1] + np.sqrt(1-rho**2)*w[i]
-                return h
+    Ts = 1.0 / max(1.0, symbol_rate)
+    fd = abs(float(doppler_hz))
+    # Approximate rho for small fd*Ts: rho ~ exp(-(2*pi*fd*Ts)^2/2). Bound it between 0 and 0.9999
+    rho = np.exp(-0.5 * (2*np.pi*fd*Ts)**2)
+    rho = min(0.9999, max(0.0, rho))
 
-        if ct == "rician":
-            K = float(self.cfg.rician_K)
-            mu = np.sqrt(K/(K+1))
-            sig = 1/np.sqrt(2*(K+1))
-            if not c.time_selective:
-                scat = (np.random.randn()+1j*np.random.randn())*sig
-                h = mu + scat
-                return np.full(n, h, dtype=np.complex128)
-            if c.fading_model == "block":
-                L = max(1, int(c.coherence_symbols))
-                blocks = (n+L-1)//L
-                scat = (np.random.randn(blocks)+1j*np.random.randn(blocks))*sig
-                hh = mu + scat
-                h = np.repeat(hh, L)[:n]
-                return h.astype(np.complex128)
-            else:
-                rho = float(c.rho)
-                w = (np.random.randn(n)+1j*np.random.randn(n))*sig*np.sqrt(2)
-                h = np.zeros(n, dtype=np.complex128)
-                h[0] = mu + w[0]
-                for i in range(1,n):
-                    h[i] = mu + rho*(h[i-1]-mu) + np.sqrt(1-rho**2)*w[i]
-                return h
+    if block_fading:
+        h0 = (rng.normal(0, np.sqrt(0.5)) + 1j*rng.normal(0, np.sqrt(0.5)))
+        h = np.ones(N, dtype=np.complex128) * h0
+    else:
+        v_real = rng.normal(0, 1.0, size=N)
+        v_imag = rng.normal(0, 1.0, size=N)
+        v = (v_real + 1j*v_imag) / np.sqrt(2.0)  # CN(0,1)
+        h = np.zeros(N, dtype=np.complex128)
+        h[0] = v[0]
+        for n in range(1, N):
+            h[n] = rho*h[n-1] + np.sqrt(1 - rho**2)*v[n]
 
-        raise ValueError("unknown channel type " + ct)
+    faded = symbols * h
 
-    def transmit(self, s: np.ndarray, esn0_db: float):
-        n = len(s)
-        h = self._fading(n)
-        esn0_lin = 10.0**(esn0_db/10.0)
-        # noise variance per complex sample = 1/esn0
-        sigma = np.sqrt(1.0/(2.0*esn0_lin))
-        w = (np.random.randn(n)+1j*np.random.randn(n))*sigma
-        y = h * s + w
-        return y, h
+    # AWGN on top
+    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    snr_lin = 10**(snr_db/10.0)
+    N0 = Es / snr_lin
+    noise = (rng.normal(0, np.sqrt(N0/2), size=N) + 1j*rng.normal(0, np.sqrt(N0/2), size=N))
+
+    return faded + noise, h
+
+def equalize(rx_symbols: np.ndarray, tx_pilot: np.ndarray, rx_pilot: np.ndarray) -> tuple[np.ndarray, complex]:
+    """
+    One-tap equalizer using average pilot-based channel estimate h_hat = mean(rx_pilot / tx_pilot).
+    Returns (equalized_symbols, h_hat).
+    """
+    # Avoid division by zero
+    mask = np.abs(tx_pilot) > 1e-12
+    if not np.any(mask):
+        return rx_symbols, 1+0j
+    h_hat = np.mean(rx_pilot[mask] / tx_pilot[mask])
+    eq = rx_symbols / (h_hat + 1e-12)
+    return eq, h_hat

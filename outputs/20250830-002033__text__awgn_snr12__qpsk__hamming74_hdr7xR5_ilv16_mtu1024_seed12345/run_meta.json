@@ -1,0 +1,39 @@
+{
+  "app": {
+    "modality": "text",
+    "validate_image_mode": false,
+    "text_encoding": "utf-8",
+    "text_errors": "replace"
+  },
+  "link": {
+    "mtu_bytes": 1024,
+    "interleaver_depth": 16,
+    "fec_scheme": "hamming74",
+    "repeat_k": 3,
+    "drop_bad_frames": false,
+    "strong_header_protection": true,
+    "header_copies": 7,
+    "header_rep_k": 5,
+    "force_output_on_hdr_fail": true,
+    "verbose": false
+  },
+  "mod": {
+    "scheme": "qpsk"
+  },
+  "chan": {
+    "channel_type": "awgn",
+    "snr_db": 12.0,
+    "seed": 12345,
+    "doppler_hz": 50.0,
+    "symbol_rate": 1000000.0,
+    "block_fading": false
+  },
+  "pilot": {
+    "preamble_len": 32,
+    "pilot_len": 16,
+    "pilot_every_n_symbols": 0
+  },
+  "modality": "text",
+  "input_file": "examples/sample.txt",
+  "output_dir": "outputs/20250830-002033__text__awgn_snr12__qpsk__hamming74_hdr7xR5_ilv16_mtu1024_seed12345"
+}

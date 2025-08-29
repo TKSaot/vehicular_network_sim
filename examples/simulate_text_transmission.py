@@ -1,0 +1,114 @@
+# examples/simulate_text_transmission.py
+"""
+設定は configs/text_config.py に集約。
+最小コマンド:  python examples/simulate_text_transmission.py
+必要なら --snr_db 等だけ上書き。
+"""
+
+import os, sys, argparse, numpy as np
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from common.utils import set_seed
+from common.run_utils import make_output_dir, write_json
+from common.config import SimulationConfig
+from app_layer.application import serialize_content, AppHeader, deserialize_content, save_output
+from transmitter.send import build_transmission
+from channel.channel_model import awgn_channel, rayleigh_fading
+from receiver.receive import recover_from_symbols
+
+from configs import text_config as CFG
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--snr_db", type=float, default=None)
+    ap.add_argument("--channel", type=str, choices=["awgn","rayleigh"], default=None)
+    ap.add_argument("--input", type=str, default=None)
+    ap.add_argument("--output_root", type=str, default=None)
+    args = ap.parse_args()
+
+    cfg: SimulationConfig = CFG.build_config()
+    input_path = args.input if args.input is not None else CFG.INPUT
+    output_root = args.output_root if args.output_root is not None else CFG.OUTPUT_ROOT
+
+    if args.snr_db is not None:
+        cfg.chan.snr_db = float(args.snr_db)
+    if args.channel is not None:
+        cfg.chan.channel_type = args.channel
+
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input text not found: {input_path}")
+
+    set_seed(cfg.chan.seed)
+
+    # TX-side (we keep hdr for last-resort fallback)
+    tx_hdr, payload = serialize_content("text", input_path, text_encoding="utf-8", validate_image_mode=False)
+    app_hdr_bytes = tx_hdr.to_bytes()
+
+    tx_syms, tx_meta = build_transmission(app_hdr_bytes, payload, cfg)
+
+    if cfg.chan.channel_type == "awgn":
+        rx_syms = awgn_channel(tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed)
+    else:
+        rx_syms, _ = rayleigh_fading(
+            tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed,
+            doppler_hz=cfg.chan.doppler_hz, symbol_rate=cfg.chan.symbol_rate,
+            block_fading=cfg.chan.block_fading
+        )
+
+    rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
+
+    # Choose header: valid → use; majority → use; else → optional force (for outputs at very low SNR)
+    hdr_used_mode = "valid"
+    if not stats.get("app_header_crc_ok", False):
+        if stats.get("app_header_recovered_via_majority", False):
+            hdr_used_mode = "majority"
+        elif cfg.link.force_output_on_hdr_fail:
+            rx_app_hdr_b = tx_hdr.to_bytes()  # forced oracle header to ensure output
+            hdr_used_mode = "forced"
+        else:
+            # As a last resort, still try to parse (may throw)
+            hdr_used_mode = "invalid"
+    try:
+        rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
+    except Exception:
+        # cannot parse, force if allowed
+        rx_hdr = tx_hdr
+        hdr_used_mode = "forced-parse-failed"
+
+    text_str, _ = deserialize_content(rx_hdr, rx_payload_b, text_encoding="utf-8", text_errors="replace")
+
+    out_dir = make_output_dir(cfg, modality="text", input_path=input_path, output_root=output_root)
+    out_txt = os.path.join(out_dir, "received_text.txt")
+    save_output(rx_hdr, text_str, np.array([]), out_txt)
+
+    orig_text = open(input_path, "r", encoding="utf-8").read()
+    recv_text = text_str
+    minlen = min(len(orig_text), len(recv_text))
+    mismatches = sum(1 for i in range(minlen) if orig_text[i] != recv_text[i]) + abs(len(orig_text)-len(recv_text))
+    cer = mismatches / max(1, len(orig_text))
+
+    report = {
+        "frames": int(stats["n_frames"]),
+        "bad_frames": int(stats["n_bad_frames"]),
+        "all_crc_ok": bool(stats["all_crc_ok"]),
+        "app_header_crc_ok": bool(stats["app_header_crc_ok"]),
+        "app_header_recovered_via_majority": bool(stats.get("app_header_recovered_via_majority", False)),
+        "app_header_used_mode": hdr_used_mode,
+        "cer_approx": float(cer),
+        "output_text": out_txt,
+    }
+    write_json(os.path.join(out_dir, "rx_stats.json"), report)
+
+    print("=== TEXT Transmission Report ===")
+    print(f"Output dir: {out_dir}")
+    print(f"SNR(dB): {cfg.chan.snr_db}, Channel: {cfg.chan.channel_type}, Mod: {cfg.mod.scheme}, FEC: {cfg.link.fec_scheme}")
+    print(f"Frames: {report['frames']}, Bad: {report['bad_frames']}, All CRC OK: {report['all_crc_ok']}")
+    print(f"Header mode: {hdr_used_mode}")
+    print(f"Approx. CER: {report['cer_approx']:.4f}")
+    print(f"Saved: {out_txt}")
+
+if __name__ == "__main__":
+    main()
