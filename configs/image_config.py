@@ -26,6 +26,9 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             header_rep_k=5,
             force_output_on_hdr_fail=True,
             verbose=False,
+            # NEW:
+            byte_mapping_scheme="permute",   # try "permute" to fully randomize
+            byte_mapping_seed=None,              # None -> use chan.seed
         ),
         mod=ModulationConfig(scheme="qpsk"),
         chan=ChannelConfig(

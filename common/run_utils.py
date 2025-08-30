@@ -15,10 +15,15 @@ def make_output_dir(cfg, modality: str, input_path: str, output_root: str = "out
     if fec == "repeat":
         fec = f"repeat{cfg.link.repeat_k}"
     hdr_tag = f"_hdr{cfg.link.header_copies}xR{cfg.link.header_rep_k}"
+    # NEW
+    map_tag = {"none":"mapNone", "permute":"mapPerm", "frame_block":"mapFB"}.get(cfg.link.byte_mapping_scheme, "map?")
+    if cfg.link.byte_mapping_scheme != "none":
+        seed_tag = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
+        map_tag += f"{seed_tag}"
 
     folder = (
         f"{ts}__{modality}__{ch}{doppler_tag}_{snr_tag}"
-        f"__{cfg.mod.scheme}__{fec}{hdr_tag}"
+        f"__{cfg.mod.scheme}__{fec}{hdr_tag}_{map_tag}"
         f"_ilv{cfg.link.interleaver_depth}"
         f"_mtu{cfg.link.mtu_bytes}"
         f"_seed{cfg.chan.seed}"

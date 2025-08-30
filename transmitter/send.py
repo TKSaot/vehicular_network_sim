@@ -9,20 +9,24 @@ import numpy as np
 
 from common.config import SimulationConfig
 from common.utils import bytes_to_bits
+from common.byte_mapping import map_bytes
 from data_link_layer.encoding import segment_message, apply_fec_and_interleave
 from physical_layer.modulation import Modulator, build_phy_frame
 
 def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: SimulationConfig):
-    """
-    Build frames from (app_header, payload) and produce concatenated complex symbols ready for the channel.
-    Returns:
-      tx_symbols: np.ndarray complex
-      tx_meta: dict with details for the receiver (frame symbol ranges, pilots, etc.)
-    """
-    # 1) Link segmentation (with APP header copies)
+    # NEW: apply byte mapping before segmentation (affects DATA frames only)
+    mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
+    mapped_payload = map_bytes(
+        payload_bytes,
+        mtu_bytes=cfg.link.mtu_bytes,
+        scheme=cfg.link.byte_mapping_scheme,
+        seed=mapping_seed
+    )
+
+    # 1) Link segmentation (with APP header copies) – pass mapped payload
     frames = segment_message(
         app_header_bytes,
-        payload_bytes,
+        mapped_payload,
         mtu_bytes=cfg.link.mtu_bytes,
         header_copies=cfg.link.header_copies
     )

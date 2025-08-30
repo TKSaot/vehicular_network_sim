@@ -1,0 +1,11 @@
+{
+  "modality": "depth",
+  "frames": 462,
+  "bad_frames": 440,
+  "all_crc_ok": false,
+  "app_header_crc_ok": true,
+  "app_header_recovered_via_majority": false,
+  "app_header_used_mode": "valid",
+  "psnr_db": 10.87969969243867,
+  "output_png": "outputs/20250831-000044__depth__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapFB12345_ilv16_mtu1024_seed12345/received.png"
+}

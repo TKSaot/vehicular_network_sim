@@ -14,6 +14,7 @@ if ROOT not in sys.path:
 from common.utils import set_seed
 from common.run_utils import make_output_dir, write_json
 from common.config import SimulationConfig
+from common.byte_mapping import unmap_bytes
 from app_layer.application import serialize_content, AppHeader, deserialize_content, save_output
 from transmitter.send import build_transmission
 from channel.channel_model import awgn_channel, rayleigh_fading
@@ -74,9 +75,17 @@ def main():
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
     except Exception:
-        # cannot parse, force if allowed
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
+
+    mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
+    rx_payload_b = unmap_bytes(
+        rx_payload_b,
+        mtu_bytes=cfg.link.mtu_bytes,
+        scheme=cfg.link.byte_mapping_scheme,
+        seed=mapping_seed,
+        original_len=rx_hdr.payload_len_bytes
+    )
 
     text_str, _ = deserialize_content(rx_hdr, rx_payload_b, text_encoding="utf-8", text_errors="replace")
 

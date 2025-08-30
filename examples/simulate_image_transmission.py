@@ -18,6 +18,7 @@ if ROOT not in sys.path:
 from common.utils import set_seed, psnr
 from common.run_utils import make_output_dir, write_json
 from common.config import SimulationConfig
+from common.byte_mapping import unmap_bytes
 from app_layer.application import serialize_content, AppHeader, deserialize_content, save_output
 from transmitter.send import build_transmission
 from channel.channel_model import awgn_channel, rayleigh_fading
@@ -77,13 +78,24 @@ def main():
             hdr_used_mode = "forced"
         else:
             hdr_used_mode = "invalid"
+    # Parse header now (may be forced/majority)
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
     except Exception:
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
 
-    # Robust image decoding (safe reshape inside)
+    # NEW: invert byte mapping using hdr.payload_len_bytes (original length)
+    mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
+    rx_payload_b = unmap_bytes(
+        rx_payload_b,
+        mtu_bytes=cfg.link.mtu_bytes,
+        scheme=cfg.link.byte_mapping_scheme,
+        seed=mapping_seed,
+        original_len=rx_hdr.payload_len_bytes
+    )
+
+    # Robust image decoding (safe reshape inside, as before)
     _, img_arr = deserialize_content(rx_hdr, rx_payload_b, text_encoding="utf-8")
 
     out_dir = make_output_dir(cfg, modality=modality, input_path=input_path, output_root=output_root)

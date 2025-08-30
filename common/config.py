@@ -19,19 +19,22 @@ class AppConfig:
 
 @dataclass
 class LinkConfig:
-    mtu_bytes: int = 1024             # payload bytes per DATA frame (before FEC/interleaving)
-    interleaver_depth: int = 8        # block interleaver depth (>=1). 1 disables interleaving
+    mtu_bytes: int = 1024
+    interleaver_depth: int = 8
     fec_scheme: Literal["none", "repeat", "hamming74", "rs255_223"] = "hamming74"
-    repeat_k: int = 3                 # used if fec_scheme == "repeat"
-    drop_bad_frames: bool = False     # if CRC fails: drop the frame (True) or keep corrupted payload (False)
+    repeat_k: int = 3
+    drop_bad_frames: bool = False
 
-    # Header robustness
-    strong_header_protection: bool = True  # keep True
-    header_copies: int = 7                 # repeat APP header frames (front) to ensure recovery at low SNR
-    header_rep_k: int = 5                  # repetition factor applied to APP header frames after FEC
-    force_output_on_hdr_fail: bool = True  # if header still fails, force using TX-known header to produce outputs
+    # Header robustness (existing)
+    strong_header_protection: bool = True
+    header_copies: int = 7
+    header_rep_k: int = 5
+    force_output_on_hdr_fail: bool = True
+    verbose: bool = False
 
-    verbose: bool = False             # print per-frame logs
+    # NEW: cross-frame mapping / randomized mapping
+    byte_mapping_scheme: Literal["none", "permute", "frame_block"] = "none"
+    byte_mapping_seed: Optional[int] = None  # if None, fall back to chan.seed
 
 @dataclass
 class ModulationConfig:

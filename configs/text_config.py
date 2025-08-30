@@ -12,14 +12,17 @@ def build_config() -> SimulationConfig:
         app=AppConfig(modality="text", validate_image_mode=False),
         link=LinkConfig(
             mtu_bytes=1024,
-            interleaver_depth=16,        # 深めでフェージング耐性向上
-            fec_scheme="hamming74",      # 低SNRで耐性を高めるなら "repeat" + repeat_k を上げる
+            interleaver_depth=16,
+            fec_scheme="hamming74",
             repeat_k=3,
             strong_header_protection=True,
-            header_copies=7,             # ヘッダ複製数
-            header_rep_k=5,              # ヘッダに更なる繰返し
+            header_copies=7,
+            header_rep_k=5,
             force_output_on_hdr_fail=True,
             verbose=False,
+            # NEW (keep off for text):
+            byte_mapping_scheme="none",
+            byte_mapping_seed=None,
         ),
         mod=ModulationConfig(scheme="qpsk"),
         chan=ChannelConfig(
