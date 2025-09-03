@@ -1,11 +1,8 @@
 # examples/simulate_image_transmission.py
 """
-設定は configs/image_config.py に集約。
-最小コマンド例:
-  python examples/simulate_image_transmission.py --modality depth
-  python examples/simulate_image_transmission.py --modality edge
-  python examples/simulate_image_transmission.py --modality segmentation
-必要なら --snr_db 等だけ上書き。
+設定は configs/image_config.py に集約．
+例:
+  python examples/simulate_image_transmission.py --modality segmentation --channel rayleigh --snr_db 10
 """
 
 import os, sys, argparse, numpy as np
@@ -51,10 +48,10 @@ def main():
 
     set_seed(cfg.chan.seed)
 
-    # TX (keep tx_hdr for last-resort)
+    # --- TX ---
     tx_hdr, payload = serialize_content(
         modality, input_path,
-        app_cfg=cfg.app,                # ★ AppConfig を渡す
+        app_cfg=cfg.app,
         text_encoding="utf-8",
         validate_image_mode=True
     )
@@ -62,6 +59,7 @@ def main():
 
     tx_syms, tx_meta = build_transmission(app_hdr_bytes, payload, cfg)
 
+    # --- Channel ---
     if cfg.chan.channel_type == "awgn":
         rx_syms = awgn_channel(tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed)
     else:
@@ -71,9 +69,9 @@ def main():
             block_fading=cfg.chan.block_fading
         )
 
+    # --- RX ---
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
 
-    # Header selection (same as before)
     hdr_used_mode = "valid"
     if not stats.get("app_header_crc_ok", False):
         if stats.get("app_header_recovered_via_majority", False):
@@ -89,7 +87,6 @@ def main():
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
 
-    # Invert byte mapping (length from app header)
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     rx_payload_b = unmap_bytes(
         rx_payload_b,
@@ -99,14 +96,12 @@ def main():
         original_len=rx_hdr.payload_len_bytes
     )
 
-    # Robust image decoding with decoder options (AppConfig)
     _, img_arr = deserialize_content(rx_hdr, rx_payload_b, app_cfg=cfg.app, text_encoding="utf-8")
 
     out_dir = make_output_dir(cfg, modality=modality, input_path=input_path, output_root=output_root)
     out_png = os.path.join(out_dir, "received.png")
     save_output(rx_hdr, "", img_arr, out_png)
 
-    # PSNR
     im_orig = Image.open(input_path)
     if modality in ("edge","depth"): im_orig = im_orig.convert("L")
     elif modality == "segmentation": im_orig = im_orig.convert("RGB")

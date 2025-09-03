@@ -1,61 +1,58 @@
 # common/config.py
 """
 Configuration dataclasses for the vehicular network simulation.
-Now includes per-modality *decoder* options (moved from env-vars to config).
+Now includes per-modality *decoder* options controlled from config (not env).
 """
 
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
-# ---------------- App-level decoder options ----------------
+# ---------- Decoder options ----------
 @dataclass
 class SegDecoderConfig:
     # Out-of-range ID fallback at decoder
     fallback: Literal["uniform", "clamp", "mod"] = "uniform"
-    seed: Optional[int] = None
-    # Majority voting
-    maj3x3: bool = False
-    maj_iters: int = 1
-    # Edge-assisted boundary protection
-    use_edge_guidance: bool = False
-    edge_guide_path: Optional[str] = None  # e.g., corrected edge PNG path
+    # Post-filter strength
+    # - "none": no smoothing
+    # - "majority3": 3x3 モード（反復 iters）
+    # - "majority5": 5x5 モード（反復 iters）
+    # - "strong":   5x5 モード + 多数派合意（consensus，min_frac）
+    mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
+    iters: int = 2
+    # consensus：近傍のうち *同一ラベル率* がこの閾値未満なら近傍モードに置換
+    consensus_min_frac: float = 0.6
+    # 乱数を使う場合の種（uniform 代替 ID への再マップなど）
+    seed: Optional[int] = 123
 
 @dataclass
 class EdgeDecoderConfig:
-    # Denoiser: majority (3/5) or median (3/5), or none
-    denoise: Literal["none", "maj3", "maj5", "median3", "median5"] = "none"
+    # Denoiser pipeline for binary edge:
+    # "none" | "maj3" | "maj5" | "median3" | "median5" |
+    # "open3" | "open5" | "open3close3" | "open5close5"
+    denoise: Literal["none","maj3","maj5","median3","median5","open3","open5","open3close3","open5close5"] = "open3close3"
     iters: int = 1
-    # For majority: threshold; default is ceil(k^2/2)
+    # Majority のしきい値（未指定なら過半数）
     thresh: Optional[int] = None
-    # Preserve thin lines: avoid turning 1->0 if it would erase a ridge
+    # 細線保護：1→0 で線が消えそうな画素は保持
     preserve_lines: bool = True
 
 @dataclass
 class DepthDecoderConfig:
-    # Filter: median (3/5), simple bilateral(5), or none
-    filt: Literal["none", "median3", "median5", "bilateral5"] = "median3"
+    # "none" | "median3" | "median5" | "bilateral5" | "median5_bilateral5"
+    filt: Literal["none","median3","median5","bilateral5","median5_bilateral5"] = "median5_bilateral5"
     iters: int = 1
-    # Bilateral parameters (5x5 kernel)
-    sigma_s: float = 1.6   # spatial
-    sigma_r: float = 12.0  # range (intensity)
+    # bilateral(5x5) のパラメータ
+    sigma_s: float = 1.6
+    sigma_r: float = 12.0
 
 @dataclass
 class AppConfig:
-    # modality: "text" | "edge" | "depth" | "segmentation"
     modality: Literal["text", "edge", "depth", "segmentation"] = "text"
-    # For images: if True, enforce the expected channel layout per modality
     validate_image_mode: bool = True
-    # For text decoding robustness: replace undecodable bytes
     text_encoding: str = "utf-8"
     text_errors: str = "replace"
 
-    # --- Segmentation TX-side (optional semantic noise; default OFF) ---
-    seg_strip_white: bool = True
-    seg_white_thresh: int = 250
-    seg_tx_noise_p: float = 0.0
-    seg_tx_noise_seed: Optional[int] = None
-
-    # --- Decoder options (moved from env to config) ---
+    # 受信側デコーダ設定
     segdec: SegDecoderConfig = field(default_factory=SegDecoderConfig)
     edgedec: EdgeDecoderConfig = field(default_factory=EdgeDecoderConfig)
     depthdec: DepthDecoderConfig = field(default_factory=DepthDecoderConfig)
@@ -94,7 +91,7 @@ class ChannelConfig:
 class PilotConfig:
     preamble_len: int = 32
     pilot_len: int = 16
-    pilot_every_n_symbols: int = 0  # unused (simple sim)
+    pilot_every_n_symbols: int = 0
 
 @dataclass
 class SimulationConfig:
