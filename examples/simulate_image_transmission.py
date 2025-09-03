@@ -63,7 +63,8 @@ def main():
         rx_syms, _ = rayleigh_fading(
             tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed,
             doppler_hz=cfg.chan.doppler_hz, symbol_rate=cfg.chan.symbol_rate,
-            block_fading=cfg.chan.block_fading
+            block_fading=cfg.chan.block_fading,
+            snr_reference=cfg.chan.snr_reference,   # ★ 受信平均SNR基準の校正
         )
 
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)

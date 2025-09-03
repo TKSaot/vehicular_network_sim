@@ -1,6 +1,6 @@
 {
   "app": {
-    "modality": "edge",
+    "modality": "depth",
     "validate_image_mode": true,
     "text_encoding": "utf-8",
     "text_errors": "replace"
@@ -28,14 +28,15 @@
     "seed": 12345,
     "doppler_hz": 30.0,
     "symbol_rate": 1000000.0,
-    "block_fading": false
+    "block_fading": false,
+    "snr_reference": "rx"
   },
   "pilot": {
     "preamble_len": 32,
     "pilot_len": 16,
     "pilot_every_n_symbols": 0
   },
-  "modality": "edge",
-  "input_file": "examples/edge_00001_.png",
-  "output_dir": "outputs/20250903-215814__edge__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu1024_seed12345"
+  "modality": "depth",
+  "input_file": "examples/depth_00001_.png",
+  "output_dir": "outputs/20250903-223645__depth__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu1024_seed12345"
 }

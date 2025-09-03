@@ -6,6 +6,6 @@
   "app_header_crc_ok": true,
   "app_header_recovered_via_majority": false,
   "app_header_used_mode": "valid",
-  "psnr_db": 6.528434331972534,
-  "output_png": "outputs/20250903-215814__edge__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu1024_seed12345/received.png"
+  "psnr_db": 6.5344720759535235,
+  "output_png": "outputs/20250903-223604__edge__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu1024_seed12345/received.png"
 }
