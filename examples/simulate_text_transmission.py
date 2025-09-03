@@ -44,8 +44,7 @@ def main():
 
     set_seed(cfg.chan.seed)
 
-    # TX-side (we keep hdr for last-resort fallback)
-    tx_hdr, payload = serialize_content("text", input_path, text_encoding="utf-8", validate_image_mode=False)
+    tx_hdr, payload = serialize_content("text", input_path, app_cfg=cfg.app, text_encoding="utf-8", validate_image_mode=False)
     app_hdr_bytes = tx_hdr.to_bytes()
 
     tx_syms, tx_meta = build_transmission(app_hdr_bytes, payload, cfg)
@@ -56,22 +55,19 @@ def main():
         rx_syms, _ = rayleigh_fading(
             tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed,
             doppler_hz=cfg.chan.doppler_hz, symbol_rate=cfg.chan.symbol_rate,
-            block_fading=cfg.chan.block_fading,
-            snr_reference=cfg.chan.snr_reference,   # ★
+            block_fading=cfg.chan.block_fading
         )
 
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
 
-    # Choose header: valid → use; majority → use; else → optional force (for outputs at very low SNR)
     hdr_used_mode = "valid"
     if not stats.get("app_header_crc_ok", False):
         if stats.get("app_header_recovered_via_majority", False):
             hdr_used_mode = "majority"
         elif cfg.link.force_output_on_hdr_fail:
-            rx_app_hdr_b = tx_hdr.to_bytes()  # forced oracle header to ensure output
+            rx_app_hdr_b = tx_hdr.to_bytes()
             hdr_used_mode = "forced"
         else:
-            # As a last resort, still try to parse (may throw)
             hdr_used_mode = "invalid"
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
@@ -88,7 +84,7 @@ def main():
         original_len=rx_hdr.payload_len_bytes
     )
 
-    text_str, _ = deserialize_content(rx_hdr, rx_payload_b, text_encoding="utf-8", text_errors="replace")
+    text_str, _ = deserialize_content(rx_hdr, rx_payload_b, app_cfg=cfg.app, text_encoding="utf-8", text_errors="replace")
 
     out_dir = make_output_dir(cfg, modality="text", input_path=input_path, output_root=output_root)
     out_txt = os.path.join(out_dir, "received_text.txt")

@@ -1,33 +1,23 @@
 # app_layer/application.py
 """
-Application-layer serializers for modalities.
+Application-layer serializers for modalities (Text, Edge, Depth, Segmentation).
 
-Segmentation is transmitted as an **ID map** with a **pre-shared palette**
-stored inside this Python process (out-of-band). We guarantee:
-- No out-of-palette IDs are introduced (IDs are always in 0..K-1).
-- No white pixels appear as an artifact in the RGB output:
-    * White boundary strokes in input PNGs are removed before palette building.
-    * The palette is forced to contain no white-like colors.
-    * If palette is missing, a deterministic "no-white" LUT is used.
+Now decoder behavior is driven by AppConfig (passed from configs/*_config.py),
+instead of environment variables. (Env vars are no longer needed.)
 
-Environment knobs (optional; sensible defaults if unset):
-- SEG_STRIP_WHITE: "1" (default) to remove white boundary strokes from input RGB.
-- SEG_WHITE_THRESH: int threshold in [0..255], default 250; RGB >= thresh on all channels is treated as white-like.
-- SEG_ID_NOISE_P: float in [0,1], default 0.0; optional semantic ID substitution prob (uniform to a different valid ID).
-- SEG_ID_NOISE_SEED: int seed for deterministic substitution (optional).
+Key features:
+- Segmentation: ID-map transmission, robust white suppression, contiguous IDs 0..K-1.
+  Decoder supports: out-of-range fallback (uniform/clamp/mod), 3x3 majority (iters),
+  and edge-assisted majority using an external edge image (PNG/L8).
+- Edge: binary majority (3/5) and median (3/5) with an option to preserve thin lines.
+- Depth: median (3/5) and lightweight bilateral(5x5).
 
-# NEW (decoder-side):
-- SEG_DECODER_FALLBACK: "uniform" (default), "clamp", or "mod".
-    * uniform: any out-of-range ID is remapped to Uniform{0..K-1} (eliminates color bias)
-    * clamp:   old behavior (min(id, K-1))  ← 黄色に寄る現象の原因
-    * mod:     id % K
-- SEG_DECODER_SEED: RNG seed for "uniform" fallback (optional)
-- SEG_DECODER_MAJ3x3: "1" to apply 3x3 majority smoothing after fallback (default "0")
+NOTE: If app_cfg is None, reasonable defaults are used (backward compatible).
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any, Optional
 import os
 import numpy as np
 from PIL import Image
@@ -75,23 +65,19 @@ class AppHeader:
 
 # ----------------- Pre-shared palette (per run) -----------------
 _SEG_PALETTE_CURRENT: np.ndarray | None = None  # shape (K,3) uint8
-
 def _set_seg_palette(palette: np.ndarray) -> None:
     global _SEG_PALETTE_CURRENT
     _SEG_PALETTE_CURRENT = palette.astype(np.uint8, copy=False)
-
 def _get_seg_palette() -> np.ndarray | None:
     return _SEG_PALETTE_CURRENT
 
-# ----------------- Utilities -----------------
+# ----------------- I/O helpers -----------------
 def load_text_as_bytes(path: str, encoding: str="utf-8") -> bytes:
     with open(path, "r", encoding=encoding) as f:
         txt = f.read()
     return txt.encode(encoding)
-
 def text_bytes_to_string(b: bytes, encoding: str="utf-8", errors: str="replace") -> str:
     return b.decode(encoding, errors=errors)
-
 def load_image_to_array(path: str, modality: str, validate_mode: bool = True) -> np.ndarray:
     im = Image.open(path)
     if modality == "edge":
@@ -100,20 +86,16 @@ def load_image_to_array(path: str, modality: str, validate_mode: bool = True) ->
         arr = np.array(im)
         if arr.ndim == 3:
             arr = np.array(im.convert("L"))
-        arr = (arr >= 128).astype(np.uint8) * 255
-        return arr
-    elif modality == "depth":
+        return (arr >= 128).astype(np.uint8) * 255
+    if modality == "depth":
         if validate_mode and im.mode != "L":
             im = im.convert("L")
-        arr = np.array(im)
-        return arr.astype(np.uint8)
-    elif modality == "segmentation":
+        return np.array(im).astype(np.uint8)
+    if modality == "segmentation":
         if im.mode != "RGB":
             im = im.convert("RGB")
-        arr = np.array(im).astype(np.uint8)
-        return arr
-    else:
-        raise ValueError("Unsupported modality for image")
+        return np.array(im).astype(np.uint8)
+    raise ValueError("Unsupported modality for image")
 
 def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     n_expected = 1
@@ -127,72 +109,75 @@ def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int, ...], dtype: np.
         arr = arr[:n_expected]
     return arr.reshape(shape)
 
-# ----------------- White handling & palette building -----------------
+# ----------------- White suppression (segmentation preproc) -----------------
 def _white_mask(rgb: np.ndarray, thresh: int) -> np.ndarray:
-    return (rgb[..., 0] >= thresh) & (rgb[..., 1] >= thresh) & (rgb[..., 2] >= thresh)
-
+    return (rgb[...,0] >= thresh) & (rgb[...,1] >= thresh) & (rgb[...,2] >= thresh)
 def _suppress_white_boundaries(rgb: np.ndarray, white_thresh: int = 250, iters: int = 2) -> np.ndarray:
     H, W, _ = rgb.shape
     out = rgb.copy()
     mask = _white_mask(out, white_thresh)
-    if not mask.any():
-        return out
+    if not mask.any(): return out
     for _ in range(max(1, iters)):
         if not mask.any(): break
-        neighs = []; neigh_nonwhite = []
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0: continue
-                py0, py1 = (max(dy, 0), max(-dy, 0))
-                px0, px1 = (max(dx, 0), max(-dx, 0))
+        neighs, neigh_nonwhite = [], []
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                if dy==0 and dx==0: continue
+                py0, py1 = (max(dy,0), max(-dy,0))
+                px0, px1 = (max(dx,0), max(-dx,0))
                 shifted = np.pad(out, ((py0,py1),(px0,px1),(0,0)), mode="edge")
                 shifted = shifted[py1:py1+H, px1:px1+W, :]
                 neighs.append(shifted)
                 neigh_nonwhite.append(~_white_mask(shifted, white_thresh))
-        stack = np.stack(neighs, axis=0)
-        stack_mask = np.stack(neigh_nonwhite, axis=0)
+        stack = np.stack(neighs, axis=0); stack_mask = np.stack(neigh_nonwhite, axis=0)
         remaining = mask.copy()
         for n in range(stack.shape[0]):
             m = stack_mask[n] & remaining
             if not m.any(): continue
-            out[m] = stack[n][m]
-            remaining[m] = False
+            out[m] = stack[n][m]; remaining[m] = False
         mask = _white_mask(out, white_thresh)
     if mask.any():
-        out[mask] = np.array([32, 32, 32], dtype=np.uint8)
+        out[mask] = np.array([32,32,32], dtype=np.uint8)
     return out
 
+# ----------------- Segmentation: build IDs & palette -----------------
 def _build_seg_ids_and_palette(rgb_arr: np.ndarray, white_thresh: int) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Robust: remove white-like colors; map to contiguous 0..K-1 by explicit old->new remap.
+    """
     H, W, _ = rgb_arr.shape
     flat = rgb_arr.reshape(-1, 3)
     uniq, inv = np.unique(flat, axis=0, return_inverse=True)
-    white_like = (uniq[:, 0] >= white_thresh) & (uniq[:, 1] >= white_thresh) & (uniq[:, 2] >= white_thresh)
+    white_like = (uniq[:,0] >= white_thresh) & (uniq[:,1] >= white_thresh) & (uniq[:,2] >= white_thresh)
+    if white_like.all():
+        palette = np.array([[32,32,32]], dtype=np.uint8)
+        id_map = np.zeros((H, W), dtype=np.uint8)
+        return id_map, palette, "id8"
+
+    nonwhite_idx = np.where(~white_like)[0]
+    nonwhite_colors = uniq[nonwhite_idx].astype(np.int32)
+
+    old2new = np.full(uniq.shape[0], -1, dtype=np.int64)
+    for new_i, old_i in enumerate(nonwhite_idx):
+        old2new[old_i] = new_i
     if white_like.any():
-        non_white_idx = np.where(~white_like)[0]
-        if non_white_idx.size == 0:
-            palette = np.array([[32, 32, 32]], dtype=np.uint8)
-            id_map = np.zeros((H, W), dtype=np.uint8)
-            return id_map, palette, "id8"
-        idx_map = np.arange(uniq.shape[0])
         for wi in np.where(white_like)[0]:
-            d = np.sum((uniq[non_white_idx].astype(np.int32) - uniq[wi].astype(np.int32))**2, axis=1)
-            nearest = non_white_idx[np.argmin(d)]
-            idx_map[idx_map == wi] = nearest
-        inv = idx_map[inv]
-        uniq = uniq[~white_like]
-    K = uniq.shape[0]
+            col = uniq[wi].astype(np.int32)
+            d2 = np.sum((nonwhite_colors - col)**2, axis=1)
+            old2new[wi] = int(np.argmin(d2))
+    inv_new = old2new[inv]; inv_new = np.maximum(inv_new, 0)
+
+    K = nonwhite_idx.size
     if K <= 256:
-        id_map = inv.astype(np.uint8).reshape(H, W); enc = "id8"
+        id_map = inv_new.astype(np.uint8).reshape(H, W); enc = "id8"
     else:
-        id_map = inv.astype(np.uint16).reshape(H, W); enc = "id16"
-    palette = uniq.astype(np.uint8)
+        id_map = inv_new.astype(np.uint16).reshape(H, W); enc = "id16"
+    palette = uniq[nonwhite_idx].astype(np.uint8)
     return id_map, palette, enc
 
 def _safe_color_lut(K: int) -> np.ndarray:
-    if K <= 0:
-        return np.zeros((1, 3), dtype=np.uint8)
-    hues = np.linspace(0.0, 1.0, K, endpoint=False)
-    sat, val = 0.85, 0.72
+    if K <= 0: return np.zeros((1,3), dtype=np.uint8)
+    hues = np.linspace(0.0, 1.0, K, endpoint=False); sat, val = 0.85, 0.72
     rgb = []
     for h in hues:
         i = int(h*6) % 6; f = (h*6) - int(h*6)
@@ -206,14 +191,12 @@ def _safe_color_lut(K: int) -> np.ndarray:
         rgb.append([int(r*255), int(g*255), int(b*255)])
     return np.array(rgb, dtype=np.uint8)
 
-# ----------------- Semantic ID corruption (TX-side) -----------------
-def _apply_id_noise_uniform(ids: np.ndarray, K: int, p: float, seed: int | None) -> np.ndarray:
-    if p <= 0.0 or K <= 1:
-        return ids
+# ----------------- Optional TX-side semantic ID noise -----------------
+def _apply_id_noise_uniform(ids: np.ndarray, K: int, p: float, seed: Optional[int]) -> np.ndarray:
+    if p <= 0.0 or K <= 1: return ids
     rng = np.random.default_rng(seed if seed is not None else (0xC0FFEE ^ (K * 2654435761 & 0xFFFFFFFF)))
     mask = rng.random(ids.shape, dtype=np.float32) < float(p)
-    if not mask.any():
-        return ids
+    if not mask.any(): return ids
     out = ids.copy()
     orig = out[mask].astype(np.int64)
     draw = rng.integers(0, K - 1, size=orig.size, dtype=np.int64)
@@ -221,13 +204,121 @@ def _apply_id_noise_uniform(ids: np.ndarray, K: int, p: float, seed: int | None)
     out[mask] = (new_ids.astype(np.uint8) if out.dtype == np.uint8 else new_ids.astype(np.uint16))
     return out
 
-# ----------------- Encode -----------------
-def serialize_content(modality: str, content_path: str, text_encoding: str="utf-8",
-                      validate_image_mode: bool=True) -> tuple[AppHeader, bytes]:
+# ----------------- Edge/Depth helpers -----------------
+def _median_filter_uint8(img: np.ndarray, k: int = 3, iters: int = 1) -> np.ndarray:
+    assert k in (3,5)
+    out = img.astype(np.uint8, copy=True)
+    for _ in range(max(1, iters)):
+        pad = k // 2
+        padded = np.pad(out, ((pad,pad),(pad,pad)), mode="edge")
+        stacks = []
+        for dy in range(k):
+            for dx in range(k):
+                stacks.append(padded[dy:dy+out.shape[0], dx:dx+out.shape[1]])
+        out = np.median(np.stack(stacks, axis=-1), axis=-1).astype(np.uint8)
+    return out
+
+def _edge_binary_majority(img01: np.ndarray, k: int = 3, thr: Optional[int] = None,
+                          iters: int = 1, preserve_lines: bool = True) -> np.ndarray:
+    """
+    Majority on {0,1}. With preserve_lines=True, avoid erasing thin ridges:
+    if center==1 and neighbor-count>=2, keep 1 even if below threshold.
+    """
+    assert k in (3,5)
+    a = (img01 > 0).astype(np.uint8)
+    if thr is None: thr = (k*k)//2 + 1
+    for _ in range(max(1, iters)):
+        pad = k // 2
+        padded = np.pad(a, ((pad,pad),(pad,pad)), mode="edge")
+        sums = np.zeros_like(a, dtype=np.uint16)
+        for dy in range(k):
+            for dx in range(k):
+                sums += padded[dy:dy+a.shape[0], dx:dx+a.shape[1]]
+        maj = (sums >= thr).astype(np.uint8)
+        if preserve_lines:
+            # keep center if it has >=2 active neighbors (8-neighborhood)
+            neigh = sums - a  # exclude center
+            keep = (a == 1) & (neigh >= 2) & (maj == 0)
+            maj[keep] = 1
+        a = maj
+    return a
+
+def _majority3x3_ids(ids: np.ndarray, iters: int = 1) -> np.ndarray:
+    H, W = ids.shape
+    out = ids.copy()
+    for _ in range(max(1, iters)):
+        pad = np.pad(out, ((1,1),(1,1)), mode="edge")
+        nxt = out.copy()
+        for r in range(H):
+            for c in range(W):
+                block = pad[r:r+3, c:c+3].reshape(-1)
+                vals, counts = np.unique(block, return_counts=True)
+                nxt[r,c] = vals[np.argmax(counts)]
+        out = nxt
+    return out
+
+def _edge_guided_majority_ids(ids: np.ndarray, edge_l8: np.ndarray, iters: int = 1) -> np.ndarray:
+    """Edge-guided 3x3 majority: prohibit crossing edges (edge=255)."""
+    H, W = ids.shape
+    edge = (edge_l8 >= 128)
+    out = ids.copy()
+    for _ in range(max(1, iters)):
+        pad_ids  = np.pad(out,  ((1,1),(1,1)), mode="edge")
+        pad_edge = np.pad(edge, ((1,1),(1,1)), mode="edge")
+        nxt = out.copy()
+        for r in range(H):
+            for c in range(W):
+                if pad_edge[r+1, c+1]:
+                    nxt[r,c] = out[r,c]
+                    continue
+                votes = []
+                for dy in (-1,0,1):
+                    for dx in (-1,0,1):
+                        if dy==0 and dx==0: continue
+                        if pad_edge[r+1+dy, c+1+dx]:  # don't cross edges
+                            continue
+                        votes.append(pad_ids[r+1+dy, c+1+dx])
+                if votes:
+                    vals, counts = np.unique(np.array(votes), return_counts=True)
+                    nxt[r,c] = vals[np.argmax(counts)]
+                else:
+                    nxt[r,c] = out[r,c]
+        out = nxt
+    return out
+
+def _bilateral5_uint8(img: np.ndarray, sigma_s: float = 1.6, sigma_r: float = 12.0, iters: int = 1) -> np.ndarray:
+    """
+    Lightweight 5x5 bilateral filter for uint8 images.
+    sigma_s: spatial std (pixels), sigma_r: range std (intensity).
+    """
+    out = img.astype(np.float32, copy=True)
+    # precompute spatial weights (5x5)
+    k = 5; pad = 2
+    yy, xx = np.mgrid[-pad:pad+1, -pad:pad+1]
+    spatial = np.exp(-(xx**2 + yy**2) / (2.0 * (sigma_s**2))).astype(np.float32)
+
+    for _ in range(max(1, iters)):
+        padded = np.pad(out, ((pad,pad),(pad,pad)), mode="edge")
+        num = np.zeros_like(out, dtype=np.float32)
+        den = np.zeros_like(out, dtype=np.float32)
+        for dy in range(-pad, pad+1):
+            for dx in range(-pad, pad+1):
+                w_s = spatial[dy+pad, dx+pad]
+                neigh = padded[dy+pad:dy+pad+out.shape[0], dx+pad:dx+pad+out.shape[1]]
+                diff = neigh - out
+                w_r = np.exp(-(diff**2) / (2.0 * (sigma_r**2))).astype(np.float32)
+                w = w_s * w_r
+                num += w * neigh
+                den += w
+        out = num / np.maximum(den, 1e-8)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+# ----------------- Serialize content (TX) -----------------
+def serialize_content(modality: str, content_path: str, app_cfg: Optional[Any] = None,
+                      text_encoding: str="utf-8", validate_image_mode: bool=True) -> tuple[AppHeader, bytes]:
     if modality == "text":
         data = load_text_as_bytes(content_path, encoding=text_encoding)
-        hdr = AppHeader(version=1, modality="text", height=0, width=0, channels=0,
-                        bits_per_sample=8, payload_len_bytes=len(data))
+        hdr = AppHeader(version=1, modality="text", payload_len_bytes=len(data))
         return hdr, data
 
     if modality in ("edge","depth"):
@@ -239,8 +330,8 @@ def serialize_content(modality: str, content_path: str, text_encoding: str="utf-
         return hdr, payload
 
     if modality == "segmentation":
-        strip_white = (os.getenv("SEG_STRIP_WHITE", "1").strip() != "0")
-        white_thresh = int(os.getenv("SEG_WHITE_THRESH", "250"))
+        strip_white  = True if app_cfg is None else bool(getattr(app_cfg, "seg_strip_white", True))
+        white_thresh = 250 if app_cfg is None else int(getattr(app_cfg, "seg_white_thresh", 250))
 
         rgb = load_image_to_array(content_path, modality="segmentation", validate_mode=True)
         if strip_white:
@@ -250,11 +341,11 @@ def serialize_content(modality: str, content_path: str, text_encoding: str="utf-
         id_map, palette, enc = _build_seg_ids_and_palette(rgb, white_thresh=white_thresh)
         _set_seg_palette(palette)
 
-        p_env = float(os.getenv("SEG_ID_NOISE_P", "0.0") or "0.0")
-        seed_env = os.getenv("SEG_ID_NOISE_SEED", "").strip()
-        seed = int(seed_env) if seed_env != "" else None
-        if p_env > 0.0:
-            id_map = _apply_id_noise_uniform(id_map, K=int(palette.shape[0]), p=p_env, seed=seed)
+        # Optional semantic noise (TX-side) -- default OFF
+        p = 0.0 if app_cfg is None else float(getattr(app_cfg, "seg_tx_noise_p", 0.0))
+        seed = None if app_cfg is None else getattr(app_cfg, "seg_tx_noise_seed", None)
+        if p > 0.0:
+            id_map = _apply_id_noise_uniform(id_map, K=int(palette.shape[0]), p=p, seed=seed)
 
         if enc == "id8":
             id_bytes = id_map.reshape(-1).tobytes(); bits = 8
@@ -267,29 +358,48 @@ def serialize_content(modality: str, content_path: str, text_encoding: str="utf-
 
     raise ValueError("Unknown modality")
 
-# ----------------- (optional) majority smoothing -----------------
-def _majority3x3(ids: np.ndarray) -> np.ndarray:
-    H, W = ids.shape
-    out = ids.copy()
-    pad = np.pad(ids, ((1,1),(1,1)), mode="edge")
-    for r in range(H):
-        for c in range(W):
-            block = pad[r:r+3, c:c+3].reshape(-1)
-            vals, cnt = np.unique(block, return_counts=True)
-            out[r, c] = vals[np.argmax(cnt)]
-    return out
-
-# ----------------- Decode -----------------
-def deserialize_content(hdr: AppHeader, payload_bytes: bytes, text_encoding: str="utf-8",
-                        text_errors: str="replace") -> tuple[str, np.ndarray]:
+# ----------------- Deserialize content (RX) -----------------
+def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[Any] = None,
+                        text_encoding: str="utf-8", text_errors: str="replace") -> tuple[str, np.ndarray]:
     if hdr.modality == "text":
         s = text_bytes_to_string(payload_bytes, encoding=text_encoding, errors=text_errors)
         return s, np.array([], dtype=np.uint8)
 
-    if hdr.modality in ("edge","depth"):
+    if hdr.modality == "edge":
         arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.uint8)
-        if hdr.modality == "edge":
-            arr = (arr >= 128).astype(np.uint8) * 255
+        arr = (arr >= 128).astype(np.uint8) * 255
+        # Decoder post-filter (config-driven)
+        edec = None if app_cfg is None else getattr(app_cfg, "edgedec", None)
+        if edec is not None:
+            mode = getattr(edec, "denoise", "none")
+            iters = int(getattr(edec, "iters", 1))
+            if mode.startswith("maj"):
+                k = 3 if mode == "maj3" else 5
+                thr = getattr(edec, "thresh", None)
+                preserve = bool(getattr(edec, "preserve_lines", True))
+                a01 = _edge_binary_majority(arr, k=k, thr=thr, iters=iters, preserve_lines=preserve)
+                arr = (a01 * 255).astype(np.uint8)
+            elif mode.startswith("median"):
+                k = 3 if mode == "median3" else 5
+                arr = _median_filter_uint8(arr, k=k, iters=iters)
+                arr = (arr >= 128).astype(np.uint8) * 255
+        return "", arr
+
+    if hdr.modality == "depth":
+        arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.uint8)
+        ddec = None if app_cfg is None else getattr(app_cfg, "depthdec", None)
+        if ddec is not None:
+            mode = getattr(ddec, "filt", "median3")
+            iters = int(getattr(ddec, "iters", 1))
+            if mode == "median3":
+                arr = _median_filter_uint8(arr, k=3, iters=iters)
+            elif mode == "median5":
+                arr = _median_filter_uint8(arr, k=5, iters=iters)
+            elif mode == "bilateral5":
+                sig_s = float(getattr(ddec, "sigma_s", 1.6))
+                sig_r = float(getattr(ddec, "sigma_r", 12.0))
+                arr = _bilateral5_uint8(arr, sigma_s=sig_s, sigma_r=sig_r, iters=iters)
+            # else: none
         return "", arr
 
     if hdr.modality == "segmentation":
@@ -302,31 +412,42 @@ def deserialize_content(hdr: AppHeader, payload_bytes: bytes, text_encoding: str
         if pal is None or pal.size == 0:
             K = int(ids.max()) + 1 if ids.size > 0 else 1
             pal = _safe_color_lut(K)
-
         K = int(pal.shape[0])
 
-        # ---- NEW: out-of-range ID fallback policy ----
-        fallback = os.getenv("SEG_DECODER_FALLBACK", "uniform").strip().lower()
+        # Out-of-range fallback (config-driven; default uniform)
+        sdec = None if app_cfg is None else getattr(app_cfg, "segdec", None)
+        fallback = "uniform" if sdec is None else getattr(sdec, "fallback", "uniform")
         if fallback == "uniform":
             invalid = (ids >= K)
             if invalid.any():
-                seed_str = os.getenv("SEG_DECODER_SEED", "").strip()
-                seed = int(seed_str) if seed_str != "" else None
+                seed = None if sdec is None else getattr(sdec, "seed", None)
                 rng = np.random.default_rng(seed if seed is not None else (0xDEADBEEF ^ (K * 11400714819323198485 & 0xFFFFFFFFFFFF)))
                 repl = rng.integers(0, K, size=int(invalid.sum()), dtype=np.int64)
-                ids_fixed = ids.copy()
-                ids_fixed[invalid] = (repl.astype(np.uint8) if ids.dtype == np.uint8 else repl.astype(np.uint16))
+                ids = ids.copy()
+                ids[invalid] = (repl.astype(np.uint8) if ids.dtype == np.uint8 else repl.astype(np.uint16))
         elif fallback == "mod":
-            ids_fixed = (ids % K).astype(ids.dtype, copy=False)
-        else:  # "clamp" (legacy)
-            ids_fixed = np.minimum(ids, K - 1)
-        # ---------------------------------------------
+            ids = (ids % K).astype(ids.dtype, copy=False)
+        else:  # "clamp" (legacy)  ← 旧実装ではこれのみだったため色偏りが出やすかった
+            ids = np.minimum(ids, K - 1)  # :contentReference[oaicite:6]{index=6}
 
-        # optional 3x3 majority smoothing
-        if os.getenv("SEG_DECODER_MAJ3x3", "0").strip() == "1":
-            ids_fixed = _majority3x3(ids_fixed)
+        # Majority smoothing (optional)
+        if sdec is not None and bool(getattr(sdec, "maj3x3", False)):
+            iters = int(getattr(sdec, "maj_iters", 1))
+            use_edge = bool(getattr(sdec, "use_edge_guidance", False))
+            if use_edge:
+                path = getattr(sdec, "edge_guide_path", None)
+                if path and os.path.isfile(path):
+                    eg = Image.open(path).convert("L")
+                    eg_arr = np.array(eg).astype(np.uint8)
+                    H = min(ids.shape[0], eg_arr.shape[0]); W = min(ids.shape[1], eg_arr.shape[1])
+                    ids = ids[:H,:W]; eg_arr = eg_arr[:H,:W]
+                    ids = _edge_guided_majority_ids(ids, eg_arr, iters=iters)
+                else:
+                    ids = _majority3x3_ids(ids, iters=iters)
+            else:
+                ids = _majority3x3_ids(ids, iters=iters)
 
-        rgb = pal[ids_fixed]
+        rgb = pal[np.minimum(ids, K - 1)]
         return "", rgb.astype(np.uint8)
 
     raise ValueError("Unknown modality in header")
