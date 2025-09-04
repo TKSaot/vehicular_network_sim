@@ -1,7 +1,6 @@
-# common/config.py
 """
 Configuration dataclasses for the vehicular network simulation.
-Now includes per-modality *decoder* options controlled from config (not env).
+Now includes per-modality *decoder* options controlled from config.
 """
 
 from dataclasses import dataclass, field
@@ -19,14 +18,13 @@ class SegDecoderConfig:
     # - "strong":   5x5 モード + 多数派合意（consensus，min_frac）
     mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
     iters: int = 2
-    # consensus：近傍のうち *同一ラベル率* がこの閾値未満なら近傍モードに置換
+    # consensus：近傍内で同一ラベル率がこの閾値未満なら近傍モードに置換
     consensus_min_frac: float = 0.6
-    # 乱数を使う場合の種（uniform 代替 ID への再マップなど）
+    # 乱数を使う処理の種（uniform 代替 ID など）
     seed: Optional[int] = 123
 
 @dataclass
 class EdgeDecoderConfig:
-    # Denoiser pipeline for binary edge:
     # "none" | "maj3" | "maj5" | "median3" | "median5" |
     # "open3" | "open5" | "open3close3" | "open5close5"
     denoise: Literal["none","maj3","maj5","median3","median5","open3","open5","open3close3","open5close5"] = "open3close3"
@@ -41,17 +39,17 @@ class DepthDecoderConfig:
     # "none" | "median3" | "median5" | "bilateral5" | "median5_bilateral5"
     filt: Literal["none","median3","median5","bilateral5","median5_bilateral5"] = "median5_bilateral5"
     iters: int = 1
-    # bilateral(5x5) のパラメータ
+    # bilateral(5x5)
     sigma_s: float = 1.6
     sigma_r: float = 12.0
 
+# ---------- App / Link / PHY / Channel ----------
 @dataclass
 class AppConfig:
     modality: Literal["text", "edge", "depth", "segmentation"] = "text"
     validate_image_mode: bool = True
     text_encoding: str = "utf-8"
     text_errors: str = "replace"
-
     # 受信側デコーダ設定
     segdec: SegDecoderConfig = field(default_factory=SegDecoderConfig)
     edgedec: EdgeDecoderConfig = field(default_factory=EdgeDecoderConfig)
@@ -61,7 +59,11 @@ class AppConfig:
 class LinkConfig:
     mtu_bytes: int = 1024
     interleaver_depth: int = 16
-    fec_scheme: Literal["none", "repeat", "hamming74", "rs255_223"] = "hamming74"
+    # ★ 802.11p 風畳み込み符号のレート名も選択可能（既定は hamming74 のまま）
+    fec_scheme: Literal[
+        "none", "repeat", "hamming74", "rs255_223",
+        "conv_k7_r12", "conv_k7_r23", "conv_k7_r34"
+    ] = "hamming74"
     repeat_k: int = 3
     drop_bad_frames: bool = False
 
@@ -71,8 +73,9 @@ class LinkConfig:
     force_output_on_hdr_fail: bool = True
     verbose: bool = False
 
+    # 送信前のバイトマッピング（フレーム化前の拡散）
     byte_mapping_scheme: Literal["none", "permute", "frame_block"] = "none"
-    byte_mapping_seed: Optional[int] = None
+    byte_mapping_seed: Optional[int] = None  # None → chan.seed を使用
 
 @dataclass
 class ModulationConfig:
@@ -86,6 +89,7 @@ class ChannelConfig:
     doppler_hz: float = 30.0
     symbol_rate: float = 1e6
     block_fading: bool = False
+    # （必要なら）snr_reference を channel 側でオプション引数に渡す
 
 @dataclass
 class PilotConfig:

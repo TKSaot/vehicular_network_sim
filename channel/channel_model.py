@@ -7,31 +7,39 @@ We operate on complex baseband symbols.
 from __future__ import annotations
 import numpy as np
 
+__all__ = ["awgn_channel", "rayleigh_fading", "equalize"]
+
 def awgn_channel(symbols: np.ndarray, snr_db: float, seed: int | None = None) -> np.ndarray:
+    """
+    Complex AWGN: SNR is Es/N0．noise variance per complex dimension is N0/2．
+    """
     rng = np.random.default_rng(seed)
-    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    Es = np.mean(np.abs(symbols)**2) if symbols.size else 1.0
     snr_lin = 10**(snr_db/10.0)
     N0 = Es / snr_lin
     noise = (rng.normal(0, np.sqrt(N0/2), size=symbols.shape) +
              1j * rng.normal(0, np.sqrt(N0/2), size=symbols.shape))
     return symbols + noise
 
-def rayleigh_fading(symbols: np.ndarray, snr_db: float, seed: int | None = None,
-                    doppler_hz: float = 30.0, symbol_rate: float = 1e6,
+def rayleigh_fading(symbols: np.ndarray,
+                    snr_db: float,
+                    seed: int | None = None,
+                    doppler_hz: float = 30.0,
+                    symbol_rate: float = 1e6,
                     block_fading: bool = False,
                     snr_reference: str = "rx") -> tuple[np.ndarray, np.ndarray]:
     """
-    Apply Rayleigh fading h[n] and AWGN. Returns (rx_symbols, h).
-
+    Rayleigh flat fading + AWGN．戻り値は (受信シンボル, フェージング h[n]) ．
     snr_reference:
-      - "tx": noise set w.r.t. transmit Es  -> N0 = Es / SNR
-      - "rx": noise set w.r.t. avg receive power Es*E[|h|^2] -> N0 = Es*E[|h|^2] / SNR
+      "rx" … N0 を平均受信電力 Es*E[|h|^2] に対して設定（既定）．
+      "tx" … 送信 Es に対して設定．
     """
     rng = np.random.default_rng(seed)
     N = len(symbols)
     if N == 0:
         return symbols.copy(), np.ones(0, dtype=np.complex128)
 
+    # 時間相関（AR(1) 近似）
     Ts = 1.0 / max(1.0, float(symbol_rate))
     fd = abs(float(doppler_hz))
     rho = np.exp(-0.5 * (2*np.pi*fd*Ts)**2)
@@ -49,23 +57,18 @@ def rayleigh_fading(symbols: np.ndarray, snr_db: float, seed: int | None = None,
 
     faded = symbols * h
 
-    # --- Average SNR calibration ---
-    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    # 平均 SNR 較正
+    Es = np.mean(np.abs(symbols)**2) if N else 1.0
     snr_lin = 10**(snr_db/10.0)
-    ref = str(snr_reference).lower()
-    if ref == "rx":
-        gain = float(np.mean(np.abs(h)**2))  # ≈ 1.0 in theory, but use sample average
-    else:
-        gain = 1.0
+    gain = float(np.mean(np.abs(h)**2)) if str(snr_reference).lower() == "rx" else 1.0
     N0 = Es * gain / snr_lin
-
     noise = (rng.normal(0, np.sqrt(N0/2), size=N) + 1j*rng.normal(0, np.sqrt(N0/2), size=N))
+
     return faded + noise, h
 
 def equalize(rx_symbols: np.ndarray, tx_pilot: np.ndarray, rx_pilot: np.ndarray) -> tuple[np.ndarray, complex]:
     """
-    One-tap equalizer using average pilot-based channel estimate h_hat = mean(rx_pilot / tx_pilot).
-    Returns (equalized_symbols, h_hat).
+    1 タップ等化．h_hat = mean(rx_pilot / tx_pilot)．
     """
     mask = np.abs(tx_pilot) > 1e-12
     if not np.any(mask):

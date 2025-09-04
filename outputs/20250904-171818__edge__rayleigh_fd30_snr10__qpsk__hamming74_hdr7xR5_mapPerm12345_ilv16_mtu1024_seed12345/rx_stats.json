@@ -1,0 +1,11 @@
+{
+  "modality": "edge",
+  "frames": 2055,
+  "bad_frames": 1974,
+  "all_crc_ok": false,
+  "app_header_crc_ok": true,
+  "app_header_recovered_via_majority": false,
+  "app_header_used_mode": "valid",
+  "psnr_db": 6.592999736419166,
+  "output_png": "outputs/20250904-171818__edge__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu1024_seed12345/received.png"
+}
