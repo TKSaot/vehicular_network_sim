@@ -214,8 +214,8 @@ def _run_single_transmission(modality: str, input_path: str, cfg: SimulationConf
 # ---------------------- Scenario & Scheduler ----------------------
 
 def _baseline_eep_mcs() -> dict:
-    # Conservative baseline; if conv_k7_r34 is available it will be taken; otherwise fallback to hamming74 at runtime
-    return {m: MCS(mod="qpsk", fec="conv_k7_r34", ilv=16) for m in MODALITIES}
+    # EEP を “少しだけ”堅牢化：QPSK + Conv(K=7) R=2/3 + interleaver 32
+    return {m: MCS(mod="qpsk", fec="conv_k7_r23", ilv=32) for m in MODALITIES}
 
 def _uep_edge_initial() -> dict:
     return {
