@@ -10,6 +10,7 @@ INPUTS = {
     "edge": "examples/edge_00001_.png",
     "depth": "examples/depth_00001_.png",
     "segmentation": "examples/segmentation_00001_.png",
+    "text": "examples/sample.txt",   # ★ 追加（存在しない場合はランナー側で /mnt/data を自動フォールバック）
 }
 OUTPUT_ROOT = "outputs"
 DEFAULT_MODALITY: Literal["edge","depth","segmentation"] = "segmentation"
@@ -21,19 +22,19 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             validate_image_mode=True,
             segdec=SegDecoderConfig(
                 fallback="uniform",
-                mode="strong",       # 5x5 モード + consensus（強め）
+                mode="strong",
                 iters=2,
                 consensus_min_frac=0.6,
                 seed=123
             ),
             edgedec=EdgeDecoderConfig(
-                denoise="open3close3",  # pepper を強く抑える既定
+                denoise="open3close3",
                 iters=1,
                 thresh=None,
                 preserve_lines=True
             ),
             depthdec=DepthDecoderConfig(
-                filt="median5_bilateral5",  # 5x5メディアン→5x5バイラテラル
+                filt="median5_bilateral5",
                 iters=1,
                 sigma_s=1.6,
                 sigma_r=12.0
