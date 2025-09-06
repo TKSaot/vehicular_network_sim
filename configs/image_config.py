@@ -41,7 +41,7 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             ),
         ),
         link=LinkConfig(
-            mtu_bytes=1024,
+            mtu_bytes=512,
             interleaver_depth=16,
             fec_scheme="hamming74",
             repeat_k=3,
