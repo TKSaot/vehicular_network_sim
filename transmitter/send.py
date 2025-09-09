@@ -1,12 +1,7 @@
 # transmitter/send.py
-"""
-Transmitter pipeline: App -> Link -> PHY assembly.
-"""
-
 from __future__ import annotations
 from typing import Dict, List, Tuple
-import numpy as np
-
+from common.backend import xp, to_xp
 from common.config import SimulationConfig
 from common.utils import bytes_to_bits
 from common.byte_mapping import map_bytes
@@ -14,7 +9,7 @@ from data_link_layer.encoding import segment_message, apply_fec_and_interleave
 from physical_layer.modulation import Modulator, build_phy_frame
 
 def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: SimulationConfig):
-    # NEW: apply byte mapping before segmentation (affects DATA frames only)
+    # Byte mapping before segmentation (DATA only)
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     mapped_payload = map_bytes(
         payload_bytes,
@@ -23,7 +18,7 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
         seed=mapping_seed
     )
 
-    # 1) Link segmentation (with APP header copies) – pass mapped payload
+    # 1) Link segmentation
     frames = segment_message(
         app_header_bytes,
         mapped_payload,
@@ -31,7 +26,7 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
         header_copies=cfg.link.header_copies
     )
 
-    # 2) Apply FEC + interleaving per frame (+ header repetition if enabled)
+    # 2) Apply FEC + interleaving
     enc_bits_list, orig_bit_lengths = apply_fec_and_interleave(
         frames,
         fec_scheme=cfg.link.fec_scheme,
@@ -42,12 +37,12 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
         header_rep_k=cfg.link.header_rep_k
     )
 
-    # 3) PHY: preamble + pilots + data symbols per frame
+    # 3) PHY: preamble + pilots + data symbols per frame (GPU if available)
     mod = Modulator(cfg.mod.scheme)
     frame_symbol_ranges: List[Tuple[int,int]] = []
-    pilots_tx: List[np.ndarray] = []
+    pilots_tx: List["xp.ndarray"] = []
     data_symbol_counts: List[int] = []
-    all_syms: List[np.ndarray] = []
+    all_syms: List["xp.ndarray"] = []
 
     cursor = 0
     for bits in enc_bits_list:
@@ -56,11 +51,11 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
             pilot_len_symbols=cfg.pilot.pilot_len)
         all_syms.append(syms)
         pilots_tx.append(pilot)
-        data_symbol_counts.append(len(data_syms))
-        frame_symbol_ranges.append((cursor, cursor+len(syms)))
-        cursor += len(syms)
+        data_symbol_counts.append(int(data_syms.size))
+        frame_symbol_ranges.append((cursor, cursor+int(syms.size)))
+        cursor += int(syms.size)
 
-    tx_symbols = np.concatenate(all_syms) if all_syms else np.zeros(0, dtype=np.complex128)
+    tx_symbols = xp.concatenate(all_syms) if all_syms else xp.zeros(0, dtype=xp.complex128)
     tx_meta = {
         "mod_scheme": cfg.mod.scheme,
         "frame_symbol_ranges": frame_symbol_ranges,

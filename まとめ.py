@@ -461,31 +461,39 @@ We operate on complex baseband symbols.
 from __future__ import annotations
 import numpy as np
 
+__all__ = ["awgn_channel", "rayleigh_fading", "equalize"]
+
 def awgn_channel(symbols: np.ndarray, snr_db: float, seed: int | None = None) -> np.ndarray:
+    """
+    Complex AWGN: SNR is Es/N0．noise variance per complex dimension is N0/2．
+    """
     rng = np.random.default_rng(seed)
-    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    Es = np.mean(np.abs(symbols)**2) if symbols.size else 1.0
     snr_lin = 10**(snr_db/10.0)
     N0 = Es / snr_lin
     noise = (rng.normal(0, np.sqrt(N0/2), size=symbols.shape) +
              1j * rng.normal(0, np.sqrt(N0/2), size=symbols.shape))
     return symbols + noise
 
-def rayleigh_fading(symbols: np.ndarray, snr_db: float, seed: int | None = None,
-                    doppler_hz: float = 30.0, symbol_rate: float = 1e6,
+def rayleigh_fading(symbols: np.ndarray,
+                    snr_db: float,
+                    seed: int | None = None,
+                    doppler_hz: float = 30.0,
+                    symbol_rate: float = 1e6,
                     block_fading: bool = False,
                     snr_reference: str = "rx") -> tuple[np.ndarray, np.ndarray]:
     """
-    Apply Rayleigh fading h[n] and AWGN. Returns (rx_symbols, h).
-
+    Rayleigh flat fading + AWGN．戻り値は (受信シンボル, フェージング h[n]) ．
     snr_reference:
-      - "tx": noise set w.r.t. transmit Es  -> N0 = Es / SNR
-      - "rx": noise set w.r.t. avg receive power Es*E[|h|^2] -> N0 = Es*E[|h|^2] / SNR
+      "rx" … N0 を平均受信電力 Es*E[|h|^2] に対して設定（既定）．
+      "tx" … 送信 Es に対して設定．
     """
     rng = np.random.default_rng(seed)
     N = len(symbols)
     if N == 0:
         return symbols.copy(), np.ones(0, dtype=np.complex128)
 
+    # 時間相関（AR(1) 近似）
     Ts = 1.0 / max(1.0, float(symbol_rate))
     fd = abs(float(doppler_hz))
     rho = np.exp(-0.5 * (2*np.pi*fd*Ts)**2)
@@ -503,23 +511,18 @@ def rayleigh_fading(symbols: np.ndarray, snr_db: float, seed: int | None = None,
 
     faded = symbols * h
 
-    # --- Average SNR calibration ---
-    Es = np.mean(np.abs(symbols)**2) if len(symbols) else 1.0
+    # 平均 SNR 較正
+    Es = np.mean(np.abs(symbols)**2) if N else 1.0
     snr_lin = 10**(snr_db/10.0)
-    ref = str(snr_reference).lower()
-    if ref == "rx":
-        gain = float(np.mean(np.abs(h)**2))  # ≈ 1.0 in theory, but use sample average
-    else:
-        gain = 1.0
+    gain = float(np.mean(np.abs(h)**2)) if str(snr_reference).lower() == "rx" else 1.0
     N0 = Es * gain / snr_lin
-
     noise = (rng.normal(0, np.sqrt(N0/2), size=N) + 1j*rng.normal(0, np.sqrt(N0/2), size=N))
+
     return faded + noise, h
 
 def equalize(rx_symbols: np.ndarray, tx_pilot: np.ndarray, rx_pilot: np.ndarray) -> tuple[np.ndarray, complex]:
     """
-    One-tap equalizer using average pilot-based channel estimate h_hat = mean(rx_pilot / tx_pilot).
-    Returns (equalized_symbols, h_hat).
+    1 タップ等化．h_hat = mean(rx_pilot / tx_pilot)．
     """
     mask = np.abs(tx_pilot) > 1e-12
     if not np.any(mask):
@@ -615,10 +618,9 @@ def unmap_bytes(data_rx: bytes, mtu_bytes: int, scheme: str = "none",
     raise ValueError(f"Unknown byte mapping scheme: {scheme}")
 
 
-# common/config.py
 """
 Configuration dataclasses for the vehicular network simulation.
-Now includes per-modality *decoder* options controlled from config (not env).
+Now includes per-modality *decoder* options controlled from config.
 """
 
 from dataclasses import dataclass, field
@@ -636,14 +638,13 @@ class SegDecoderConfig:
     # - "strong":   5x5 モード + 多数派合意（consensus，min_frac）
     mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
     iters: int = 2
-    # consensus：近傍のうち *同一ラベル率* がこの閾値未満なら近傍モードに置換
+    # consensus：近傍内で同一ラベル率がこの閾値未満なら近傍モードに置換
     consensus_min_frac: float = 0.6
-    # 乱数を使う場合の種（uniform 代替 ID への再マップなど）
+    # 乱数を使う処理の種（uniform 代替 ID など）
     seed: Optional[int] = 123
 
 @dataclass
 class EdgeDecoderConfig:
-    # Denoiser pipeline for binary edge:
     # "none" | "maj3" | "maj5" | "median3" | "median5" |
     # "open3" | "open5" | "open3close3" | "open5close5"
     denoise: Literal["none","maj3","maj5","median3","median5","open3","open5","open3close3","open5close5"] = "open3close3"
@@ -658,17 +659,17 @@ class DepthDecoderConfig:
     # "none" | "median3" | "median5" | "bilateral5" | "median5_bilateral5"
     filt: Literal["none","median3","median5","bilateral5","median5_bilateral5"] = "median5_bilateral5"
     iters: int = 1
-    # bilateral(5x5) のパラメータ
+    # bilateral(5x5)
     sigma_s: float = 1.6
     sigma_r: float = 12.0
 
+# ---------- App / Link / PHY / Channel ----------
 @dataclass
 class AppConfig:
     modality: Literal["text", "edge", "depth", "segmentation"] = "text"
     validate_image_mode: bool = True
     text_encoding: str = "utf-8"
     text_errors: str = "replace"
-
     # 受信側デコーダ設定
     segdec: SegDecoderConfig = field(default_factory=SegDecoderConfig)
     edgedec: EdgeDecoderConfig = field(default_factory=EdgeDecoderConfig)
@@ -678,7 +679,11 @@ class AppConfig:
 class LinkConfig:
     mtu_bytes: int = 1024
     interleaver_depth: int = 16
-    fec_scheme: Literal["none", "repeat", "hamming74", "rs255_223"] = "hamming74"
+    # ★ 802.11p 風畳み込み符号のレート名も選択可能（既定は hamming74 のまま）
+    fec_scheme: Literal[
+        "none", "repeat", "hamming74", "rs255_223",
+        "conv_k7_r12", "conv_k7_r23", "conv_k7_r34"
+    ] = "hamming74"
     repeat_k: int = 3
     drop_bad_frames: bool = False
 
@@ -688,8 +693,9 @@ class LinkConfig:
     force_output_on_hdr_fail: bool = True
     verbose: bool = False
 
+    # 送信前のバイトマッピング（フレーム化前の拡散）
     byte_mapping_scheme: Literal["none", "permute", "frame_block"] = "none"
-    byte_mapping_seed: Optional[int] = None
+    byte_mapping_seed: Optional[int] = None  # None → chan.seed を使用
 
 @dataclass
 class ModulationConfig:
@@ -703,6 +709,7 @@ class ChannelConfig:
     doppler_hz: float = 30.0
     symbol_rate: float = 1e6
     block_fading: bool = False
+    # （必要なら）snr_reference を channel 側でオプション引数に渡す
 
 @dataclass
 class PilotConfig:
@@ -883,6 +890,7 @@ INPUTS = {
     "edge": "examples/edge_00001_.png",
     "depth": "examples/depth_00001_.png",
     "segmentation": "examples/segmentation_00001_.png",
+    "text": "examples/sample.txt",   # ★ 追加（存在しない場合はランナー側で /mnt/data を自動フォールバック）
 }
 OUTPUT_ROOT = "outputs"
 DEFAULT_MODALITY: Literal["edge","depth","segmentation"] = "segmentation"
@@ -894,26 +902,26 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             validate_image_mode=True,
             segdec=SegDecoderConfig(
                 fallback="uniform",
-                mode="strong",       # 5x5 モード + consensus（強め）
+                mode="strong",
                 iters=2,
                 consensus_min_frac=0.6,
                 seed=123
             ),
             edgedec=EdgeDecoderConfig(
-                denoise="open3close3",  # pepper を強く抑える既定
+                denoise="open3close3",
                 iters=1,
                 thresh=None,
                 preserve_lines=True
             ),
             depthdec=DepthDecoderConfig(
-                filt="median5_bilateral5",  # 5x5メディアン→5x5バイラテラル
+                filt="median5_bilateral5",
                 iters=1,
                 sigma_s=1.6,
                 sigma_r=12.0
             ),
         ),
         link=LinkConfig(
-            mtu_bytes=1024,
+            mtu_bytes=512,
             interleaver_depth=16,
             fec_scheme="hamming74",
             repeat_k=3,
@@ -1229,7 +1237,6 @@ def reassemble_and_check(frames_bytes: List[bytes], header_copies: int = 1,
     return hdr_payload, bytes(data), stats
 
 
-# data_link_layer/error_correction.py
 """
 Error correction schemes:
 - None
@@ -1372,19 +1379,16 @@ class ConvK7FEC(FECBase):
       R=1/2: p0=[1],        p1=[1]
       R=2/3: p0=[1,1,0],    p1=[1,0,1]
       R=3/4: p0=[1,1,0,1],  p1=[1,0,1,1]
-    Hard-decision Viterbi (64 states). Tail-bitingは用いず，ゼロ終端（m=6個の0）．
+    Hard-decision Viterbi (64 states). Zero termination (m=6).
     """
     def __init__(self, rate: str = "1/2"):
-        rate = str(rate).lower().replace("r","").replace("_","/")  # "3/4" 等へ正規化
+        rate = str(rate).lower().replace("r","").replace("_","/")
         if rate in ("1/2", "12"):
-            p0, p1 = [1], [1]; R = 1/2
-            self.name = "conv_k7_r12"
+            p0, p1 = [1], [1]; R = 1/2; self.name = "conv_k7_r12"
         elif rate in ("2/3", "23"):
-            p0, p1 = [1,1,0], [1,0,1]; R = 2/3
-            self.name = "conv_k7_r23"
+            p0, p1 = [1,1,0], [1,0,1]; R = 2/3; self.name = "conv_k7_r23"
         elif rate in ("3/4", "34"):
-            p0, p1 = [1,1,0,1], [1,0,1,1]; R = 3/4
-            self.name = "conv_k7_r34"
+            p0, p1 = [1,1,0,1], [1,0,1,1]; R = 3/4; self.name = "conv_k7_r34"
         else:
             raise ValueError(f"Unsupported conv. rate: {rate}")
         self.p0 = np.array(p0, dtype=np.uint8)
@@ -1392,13 +1396,11 @@ class ConvK7FEC(FECBase):
         self.period = len(p0)
         self.code_rate = float(R)
 
-        # mother code params
         self.m = 6
         self.K = 7
         self.g0 = 0o133
         self.g1 = 0o171
 
-        # Precompute trellis
         S = 1 << self.m
         self.next_state = np.zeros((S, 2), dtype=np.int32)
         self.out0 = np.zeros((S, 2), dtype=np.uint8)
@@ -1413,7 +1415,6 @@ class ConvK7FEC(FECBase):
                 self.out0[s, u] = y0
                 self.out1[s, u] = y1
 
-    # --- encode/decode ---
     def encode(self, bits: np.ndarray) -> np.ndarray:
         b = np.asarray(bits, dtype=np.uint8).reshape(-1)
         s = 0
@@ -1422,51 +1423,37 @@ class ConvK7FEC(FECBase):
             y0 = int(self.out0[s, int(u)]); y1 = int(self.out1[s, int(u)])
             y0_list.append(y0); y1_list.append(y1)
             s = int(self.next_state[s, int(u)])
-        # tail zeros (zero-termination)
-        for _ in range(self.m):
+        for _ in range(self.m):  # zero-termination
             y0 = int(self.out0[s, 0]); y1 = int(self.out1[s, 0])
             y0_list.append(y0); y1_list.append(y1)
             s = int(self.next_state[s, 0])
 
-        # puncture
         out = []
         P = self.period
         for t in range(len(y0_list)):
-            if self.p0[t % P]:
-                out.append(y0_list[t])
-            if self.p1[t % P]:
-                out.append(y1_list[t])
+            if self.p0[t % P]: out.append(y0_list[t])
+            if self.p1[t % P]: out.append(y1_list[t])
         return np.array(out, dtype=np.uint8)
 
     def _depuncture_to_pairs(self, bits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return (obs0, obs1) of length T; missing positions = -1."""
         r = np.asarray(bits, dtype=np.uint8).reshape(-1)
         obs0, obs1 = [], []
-        i = 0
-        P = self.period
+        i = 0; P = self.period
         while i < len(r):
-            # stream 0
             if self.p0[len(obs0) % P]:
-                if i < len(r): b0 = int(r[i]); i += 1
-                else:          b0 = -1
+                b0 = int(r[i]) if i < len(r) else -1; i += 1
             else:
                 b0 = -1
-            # stream 1
             if self.p1[len(obs1) % P]:
-                if i < len(r): b1 = int(r[i]); i += 1
-                else:          b1 = -1
+                b1 = int(r[i]) if i < len(r) else -1; i += 1
             else:
                 b1 = -1
             obs0.append(b0); obs1.append(b1)
         return np.array(obs0, dtype=np.int16), np.array(obs1, dtype=np.int16)
 
     def decode(self, bits: np.ndarray) -> np.ndarray:
-        # Depuncture
         obs0, obs1 = self._depuncture_to_pairs(bits)
-        T = int(len(obs0))
-        S = 1 << self.m
-        INF = 10**9
-
+        T = int(len(obs0)); S = 1 << self.m; INF = 10**9
         pm = np.full(S, INF, dtype=np.int64); pm[0] = 0
         prev_state = np.full((T, S), -1, dtype=np.int16)
         prev_bit   = np.zeros((T, S), dtype=np.uint8)
@@ -1476,9 +1463,8 @@ class ConvK7FEC(FECBase):
             o0, o1 = int(obs0[t]), int(obs1[t])
             for ps in range(S):
                 m0 = pm[ps]
-                if m0 >= INF:  # unreachable
-                    continue
-                for u in (0, 1):
+                if m0 >= INF: continue
+                for u in (0,1):
                     ns = int(self.next_state[ps, u])
                     y0 = int(self.out0[ps, u]); y1 = int(self.out1[ps, u])
                     dist = 0
@@ -1491,7 +1477,6 @@ class ConvK7FEC(FECBase):
                         prev_bit[t, ns] = u
             pm = new_pm
 
-        # prefer zero state (due to zero-termination); fallback to argmin
         end_state = 0 if pm[0] < INF else int(np.argmin(pm))
         s = end_state
         bits_rev = []
@@ -1499,10 +1484,8 @@ class ConvK7FEC(FECBase):
             u = int(prev_bit[t, s])
             bits_rev.append(u)
             s = int(prev_state[t, s])
-            if s < 0:  # break in path; pad
-                s = 0
+            if s < 0: s = 0
         seq = bits_rev[::-1]
-        # remove tail bits (m zeros appended at encoder)
         if len(seq) >= self.m:
             seq = seq[:len(seq) - self.m]
         return np.array(seq, dtype=np.uint8)
@@ -1529,6 +1512,550 @@ def make_fec(scheme: str, repeat_k: int = 3) -> FECBase:
     if s in ("conv_k7_r34", "convk7_r34", "conv_k7_3_4"):
         return ConvK7FEC(rate="3/4")
     raise ValueError(f"Unknown FEC scheme: {scheme}")
+
+
+# examples/run_uep_experiment.py
+"""
+Run EEP vs UEP experiments with equal airtime (equal total symbols) across modalities.
+
+- Scenarios:
+    * eep        : Equal Error Protection (uniform MCS for all modalities)
+    * uep_edge   : Edge-prioritized protection
+    * uep_depth  : Depth-prioritized protection
+    * all        : Run all three above
+
+- SNR sweep: default "1,4,8,12"
+- Channel:  rayleigh (default) or awgn
+- Outputs:
+    outputs/experiments/<scenario>/snr_<XdB>/<modality>/(received.png|received.txt, rx_stats.json)
+    outputs/experiments/<scenario>/summary_<scenario>.csv (append rows per SNR)
+
+Notes:
+- Keeps the #2 baseline intact. Only orchestrates per-modality configs from outside.
+- If a requested FEC scheme is not supported in your local tree, it falls back to "hamming74".
+- Equal airtime is matched to EEP's total symbol count within a default tolerance of 1%.
+"""
+
+from __future__ import annotations
+import os, sys, csv, json, argparse
+import copy
+import numpy as np
+from PIL import Image
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# Project utilities (already present in your tree)
+from common.config import SimulationConfig
+from common.utils import set_seed, psnr
+from common.run_utils import write_json
+from common.byte_mapping import unmap_bytes
+
+from app_layer.application import (
+    serialize_content, AppHeader, deserialize_content, save_output
+)
+from transmitter.send import build_transmission
+from channel.channel_model import awgn_channel, rayleigh_fading
+from receiver.receive import recover_from_symbols
+
+# Default inputs (we add 'text' path here via image_config)
+from configs import image_config as CFG
+
+# ---------------------- Helpers ----------------------
+
+MODALITIES = ["edge", "depth", "segmentation", "text"]
+BPS = {"bpsk": 1, "qpsk": 2, "16qam": 4}
+
+class MCS:
+    def __init__(self, mod: str = "qpsk", fec: str = "hamming74", ilv: int = 16):
+        self.mod = mod
+        self.fec = fec
+        self.ilv = ilv
+    def copy(self): return MCS(self.mod, self.fec, self.ilv)
+    def as_dict(self): return {"mod": self.mod, "fec": self.fec, "interleaver_depth": self.ilv}
+
+def _ensure_input_path(modality: str, path: str | None) -> str:
+    if path is not None and os.path.isfile(path):
+        return path
+    if modality in CFG.INPUTS and os.path.isfile(CFG.INPUTS[modality]):
+        return CFG.INPUTS[modality]
+    # final fallbacks for robustness
+    fallback = {
+        "text": "examples/sample.txt",
+        "edge": "examples/edge_00001_.png",
+        "depth": "examples/depth_00001_.png",
+        "segmentation": "examples/segmentation_00001_.png",
+    }[modality]
+    if os.path.isfile(fallback):
+        return fallback
+    # allow /mnt/data paths if user placed samples there
+    mnt = {
+        "text": "/mnt/data/sample.txt",
+        "edge": "/mnt/data/edge_aachen_72_00001_.png",
+        "depth": "/mnt/data/depth_aachen_72_00001_.png",
+        "segmentation": "/mnt/data/segmentation_aachen_72_00001_.png",
+    }[modality]
+    if os.path.isfile(mnt):
+        return mnt
+    raise FileNotFoundError(f"No input found for modality={modality}")
+
+def _apply_mcs_to_cfg(cfg: SimulationConfig, mcs: MCS, drop_bad_frames: bool) -> None:
+    cfg.mod.scheme = mcs.mod
+    cfg.link.fec_scheme = mcs.fec
+    cfg.link.interleaver_depth = int(mcs.ilv)
+    cfg.link.drop_bad_frames = bool(drop_bad_frames)
+    # keep mapping & header protection as in your tree
+    if cfg.link.byte_mapping_seed is None:
+        cfg.link.byte_mapping_seed = cfg.chan.seed
+
+def _estimate_symbols_for_modality(modality: str, input_path: str,
+                                   cfg: SimulationConfig) -> tuple[int, AppHeader, bytes]:
+    """
+    Build a transmission once and return exact symbol length, header bytes.
+    """
+    # Serialize
+    hdr, payload = serialize_content(modality, input_path, app_cfg=cfg.app,
+                                     text_encoding="utf-8", validate_image_mode=True)
+    hdr_bytes = hdr.to_bytes()
+    # Try building; if FEC unsupported, fallback to hamming74
+    try:
+        tx_syms, _ = build_transmission(hdr_bytes, payload, cfg)
+    except Exception as e:
+        # FEC unknown or not implemented in local tree
+        if "Unknown FEC scheme" in str(e) or "rs255_223" in str(e) or "conv_k7" in str(e):
+            old = cfg.link.fec_scheme
+            cfg.link.fec_scheme = "hamming74"
+            tx_syms, _ = build_transmission(hdr_bytes, payload, cfg)
+            print(f"[WARN] FEC '{old}' unsupported here. Fell back to 'hamming74' for {modality}.")
+        else:
+            raise
+    return int(len(tx_syms)), hdr, payload
+
+def _run_single_transmission(modality: str, input_path: str, cfg: SimulationConfig,
+                             channel: str, snr_db: float, out_dir: str,
+                             prebuilt_hdr: AppHeader | None = None,
+                             prebuilt_payload: bytes | None = None) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Prepare header & payload
+    if prebuilt_hdr is None or prebuilt_payload is None:
+        hdr, payload = serialize_content(modality, input_path, app_cfg=cfg.app,
+                                         text_encoding="utf-8", validate_image_mode=True)
+    else:
+        hdr, payload = prebuilt_hdr, prebuilt_payload
+    hdr_bytes = hdr.to_bytes()
+
+    # TX
+    tx_syms, tx_meta = build_transmission(hdr_bytes, payload, cfg)
+
+    # Channel
+    if channel == "awgn":
+        rx_syms = awgn_channel(tx_syms, snr_db, seed=cfg.chan.seed)
+    else:
+        rx_syms, _ = rayleigh_fading(
+            tx_syms, snr_db, seed=cfg.chan.seed,
+            doppler_hz=cfg.chan.doppler_hz, symbol_rate=cfg.chan.symbol_rate,
+            block_fading=cfg.chan.block_fading,  # snr_reference="rx" by default in your channel model
+        )
+
+    # RX
+    rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
+
+    # Try parse header; if failed and force_output_on_hdr_fail, fall back to TX hdr
+    try:
+        rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
+    except Exception:
+        rx_hdr = hdr
+
+    # Byte unmapping
+    mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
+    rx_payload_b = unmap_bytes(
+        rx_payload_b,
+        mtu_bytes=cfg.link.mtu_bytes,
+        scheme=cfg.link.byte_mapping_scheme,
+        seed=mapping_seed,
+        original_len=rx_hdr.payload_len_bytes,
+    )
+
+    # Deserialize & Save
+    text_str, img_arr = deserialize_content(rx_hdr, rx_payload_b, app_cfg=cfg.app, text_encoding="utf-8")
+    if modality == "text":
+        out_path = os.path.join(out_dir, "received.txt")
+        save_output(rx_hdr, text_str, img_arr, out_path)
+        psnr_db = None
+    else:
+        out_path = os.path.join(out_dir, "received.png")
+        save_output(rx_hdr, text_str, img_arr, out_path)
+        # PSNR quick check (for your internal reference; ComfyUI will handle FID/LPIPS)
+        try:
+            im_orig = Image.open(input_path)
+            if modality in ("edge", "depth"): im_orig = im_orig.convert("L")
+            elif modality == "segmentation": im_orig = im_orig.convert("RGB")
+            arr_orig = np.array(im_orig)
+            if arr_orig.shape != img_arr.shape:
+                arr_orig = arr_orig[:img_arr.shape[0], :img_arr.shape[1], ...]
+            psnr_db = float(psnr(arr_orig.astype(np.uint8), img_arr.astype(np.uint8), data_range=255))
+        except Exception:
+            psnr_db = None
+
+    # Write stats json with extra fields
+    rec = {
+        "modality": modality,
+        "fec": cfg.link.fec_scheme,
+        "modulation": cfg.mod.scheme,
+        "interleaver_depth": cfg.link.interleaver_depth,
+        "snr_db": snr_db,
+        "channel": channel,
+        "output_path": out_path,
+        "psnr_db": psnr_db,
+    }
+    # merge rx stats
+    for k, v in stats.items():
+        if isinstance(v, (np.bool_, bool)):
+            rec[k] = bool(v)
+        elif isinstance(v, (np.integer, int)):
+            rec[k] = int(v)
+        elif isinstance(v, (np.floating, float)):
+            rec[k] = float(v)
+        else:
+            try:
+                rec[k] = int(v)
+            except Exception:
+                pass
+
+    write_json(os.path.join(out_dir, "rx_stats.json"), rec)
+    return rec
+
+# ---------------------- Scenario & Scheduler ----------------------
+
+def _baseline_eep_mcs() -> dict:
+    # 強化EEP: QPSK + Conv(K=7) R=2/3 + interleaver 32
+    return {m: MCS(mod="qpsk", fec="conv_k7_r23", ilv=32) for m in MODALITIES}
+
+
+def _uep_edge_initial() -> dict:
+    return {
+        "edge": MCS(mod="bpsk", fec="conv_k7_r12", ilv=32),
+        "depth": MCS(mod="qpsk", fec="conv_k7_r23", ilv=24),
+        "segmentation": MCS(mod="qpsk", fec="conv_k7_r34", ilv=16),
+        "text": MCS(mod="qpsk", fec="conv_k7_r12", ilv=32),
+    }
+
+def _uep_depth_initial() -> dict:
+    return {
+        "depth": MCS(mod="bpsk", fec="conv_k7_r12", ilv=32),
+        "edge": MCS(mod="qpsk", fec="conv_k7_r23", ilv=24),
+        "segmentation": MCS(mod="qpsk", fec="conv_k7_r34", ilv=16),
+        "text": MCS(mod="qpsk", fec="conv_k7_r12", ilv=32),
+    }
+
+def _next_lighter(mcs: MCS) -> MCS | None:
+    # lighten = consume fewer symbols (higher throughput): try FEC 2/3->3/4, 1/2->2/3->3/4; then modulation BPSK->QPSK->16QAM
+    order_fec = ["conv_k7_r12", "conv_k7_r23", "conv_k7_r34", "hamming74"]  # treat hamming ~ light-ish
+    order_mod = ["bpsk", "qpsk", "16qam"]
+    m = mcs.copy()
+    # fec step up
+    if m.fec in order_fec:
+        idx = order_fec.index(m.fec)
+        if idx + 1 < len(order_fec):
+            m.fec = order_fec[idx + 1]; return m
+    # modulation step up
+    if m.mod in order_mod:
+        im = order_mod.index(m.mod)
+        if im + 1 < len(order_mod):
+            m.mod = order_mod[im + 1]; return m
+    return None
+
+def _next_stronger(mcs: MCS) -> MCS | None:
+    # stronger = more redundancy (more symbols): 3/4->2/3->1/2; 16QAM->QPSK->BPSK
+    order_fec = ["hamming74", "conv_k7_r34", "conv_k7_r23", "conv_k7_r12"]
+    order_mod = ["16qam", "qpsk", "bpsk"]
+    m = mcs.copy()
+    if m.fec in order_fec:
+        idx = order_fec.index(m.fec)
+        if idx + 1 < len(order_fec):
+            m.fec = order_fec[idx + 1]; return m
+    if m.mod in order_mod:
+        im = order_mod.index(m.mod)
+        if im + 1 < len(order_mod):
+            m.mod = order_mod[im + 1]; return m
+    return None
+
+def _build_cfg(modality: str, mcs: MCS, chan_type: str, snr_db: float, seed: int,
+               drop_bad_frames: bool) -> SimulationConfig:
+    cfg: SimulationConfig = CFG.build_config(modality=modality)
+    cfg.chan.channel_type = chan_type
+    cfg.chan.snr_db = float(snr_db)
+    cfg.chan.seed = int(seed)
+    _apply_mcs_to_cfg(cfg, mcs, drop_bad_frames=drop_bad_frames)
+    return cfg
+
+def _equal_airtime_adjust(target_total_syms: int,
+                          init_mcs: dict,
+                          inputs: dict,
+                          chan_type: str,
+                          snr_db: float,
+                          seed: int,
+                          drop_bad_frames: bool,
+                          priority: str) -> tuple[dict, dict]:
+    """
+    Adjust non-priority modalities' MCS so that sum(symbols) ~= target_total_syms (±1%).
+    Returns (final_mcs_dict, prebuilt_cache) where prebuilt_cache carries (hdr, payload, sym_len) for reuse.
+    """
+    # Prebuild headers/payloads once per modality (independent of MCS)
+    prebuilt = {}
+    # We'll estimate symbols per modality for current MCS by actually building transmissions.
+    def estimate_for_mod(m, mcs_obj):
+        cfg = _build_cfg(m, mcs_obj, chan_type, snr_db, seed, drop_bad_frames)
+        if m in prebuilt and prebuilt[m].get("payload") is not None and prebuilt[m].get("hdr") is not None:
+            # reuse payload if available
+            hdr = prebuilt[m]["hdr"]; payload = prebuilt[m]["payload"]
+            hdr_b = hdr.to_bytes()
+            try:
+                tx_syms, _ = build_transmission(hdr_b, payload, cfg)
+            except Exception as e:
+                if "Unknown FEC scheme" in str(e) or "rs255_223" in str(e) or "conv_k7" in str(e):
+                    old = cfg.link.fec_scheme
+                    cfg.link.fec_scheme = "hamming74"
+                    tx_syms, _ = build_transmission(hdr_b, payload, cfg)
+                    print(f"[WARN] FEC '{old}' unsupported. Fallback to 'hamming74' for {m}.")
+                else:
+                    raise
+            return len(tx_syms), hdr, payload
+        else:
+            # serialize fresh
+            cfg_serialize = CFG.build_config(modality=m)  # app-layer settings only
+            inp = inputs[m]
+            hdr, payload = serialize_content(m, inp, app_cfg=cfg_serialize.app, text_encoding="utf-8", validate_image_mode=True)
+            prebuilt[m] = {"hdr": hdr, "payload": payload}
+            hdr_b = hdr.to_bytes()
+            try:
+                tx_syms, _ = build_transmission(hdr_b, payload, cfg)
+            except Exception as e:
+                if "Unknown FEC scheme" in str(e) or "rs255_223" in str(e) or "conv_k7" in str(e):
+                    old = cfg.link.fec_scheme
+                    cfg.link.fec_scheme = "hamming74"
+                    tx_syms, _ = build_transmission(hdr_b, payload, cfg)
+                    print(f"[WARN] FEC '{old}' unsupported. Fallback to 'hamming74' for {m}.")
+                else:
+                    raise
+            return len(tx_syms), hdr, payload
+
+    mcs = {m: init_mcs[m].copy() for m in MODALITIES}
+    # initial estimate
+    sym_len = {}
+    total = 0
+    for m in MODALITIES:
+        n, hdr, payload = estimate_for_mod(m, mcs[m])
+        sym_len[m] = n; total += n
+        prebuilt[m] = {"hdr": hdr, "payload": payload, "sym_len": n}
+
+    tol = int(max(1, round(target_total_syms * 0.01)))  # ±1% tolerance
+    max_iter = 20
+
+    # Which modalities to adjust first?
+    if priority == "edge":
+        lighten_order = ["segmentation", "depth", "text"]  # do not lighten 'edge'
+        strengthen_order = ["segmentation", "depth", "text"]  # fill budget here first
+    elif priority == "depth":
+        lighten_order = ["segmentation", "edge", "text"]
+        strengthen_order = ["segmentation", "edge", "text"]
+    else:
+        lighten_order = ["segmentation", "depth", "edge", "text"]
+        strengthen_order = ["segmentation", "depth", "edge", "text"]
+
+    it = 0
+    while abs(total - target_total_syms) > tol and it < max_iter:
+        it += 1
+        if total > target_total_syms:
+            # Too heavy → lighten non-priority modalities
+            changed = False
+            for m in lighten_order:
+                if m == priority: 
+                    continue
+                cand = _next_lighter(mcs[m])
+                if cand is None: 
+                    continue
+                # try this step
+                mcs[m] = cand
+                n, hdr, payload = estimate_for_mod(m, mcs[m])
+                total = sum(sym_len[x] if x != m else n for x in MODALITIES)
+                sym_len[m] = n
+                prebuilt[m] = {"hdr": hdr, "payload": payload, "sym_len": n}
+                changed = True
+                if abs(total - target_total_syms) <= tol:
+                    break
+            if not changed:
+                break  # cannot lighten further
+        else:
+            # Too light → strengthen non-priority modalities to fill budget
+            changed = False
+            for m in strengthen_order:
+                if m == priority:
+                    continue
+                cand = _next_stronger(mcs[m])
+                if cand is None:
+                    continue
+                mcs[m] = cand
+                n, hdr, payload = estimate_for_mod(m, mcs[m])
+                total = sum(sym_len[x] if x != m else n for x in MODALITIES)
+                sym_len[m] = n
+                prebuilt[m] = {"hdr": hdr, "payload": payload, "sym_len": n}
+                changed = True
+                if abs(total - target_total_syms) <= tol:
+                    break
+            if not changed:
+                break
+
+    return mcs, prebuilt
+
+# ---------------------- Main runner ----------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scenario", type=str, choices=["eep", "uep_edge", "uep_depth", "all"], default="all")
+    ap.add_argument("--snrs", type=str, default="1,4,8,12")
+    ap.add_argument("--channel", type=str, choices=["awgn","rayleigh"], default="rayleigh")
+    ap.add_argument("--output_root", type=str, default="outputs/experiments")
+    ap.add_argument("--drop_bad_frames", type=int, choices=[0,1], default=1)
+    # Optional: custom inputs
+    ap.add_argument("--edge", type=str, default=None)
+    ap.add_argument("--depth", type=str, default=None)
+    ap.add_argument("--seg", type=str, default=None)
+    ap.add_argument("--text", type=str, default=None)
+    args = ap.parse_args()
+
+    snr_list = [float(s) for s in args.snrs.split(",") if s.strip()]
+    drop_bad = bool(args.drop_bad_frames)
+
+    # Resolve inputs
+    inputs = {
+        "edge": _ensure_input_path("edge", args.edge),
+        "depth": _ensure_input_path("depth", args.depth),
+        "segmentation": _ensure_input_path("segmentation", args.seg),
+        "text": _ensure_input_path("text", args.text),
+    }
+
+    scenarios = []
+    if args.scenario == "all":
+        scenarios = ["eep", "uep_edge", "uep_depth"]
+    else:
+        scenarios = [args.scenario]
+
+    # Seeds: fix per (snr, modality) so EEP/UEP are comparable
+    base_seed = 12345
+
+    for scen in scenarios:
+        out_root = os.path.join(args.output_root, scen)
+        os.makedirs(out_root, exist_ok=True)
+        summary_csv = os.path.join(out_root, f"summary_{scen}.csv")
+        if not os.path.isfile(summary_csv):
+            with open(summary_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "scenario","snr_db","modality","fec","modulation","interleaver_depth",
+                    "symbols_tx","frames","bad_frames","all_crc_ok","psnr_db","output_path"
+                ])
+
+        # 1) Baseline EEP total symbols (target for equal airtime)
+        eep_mcs = _baseline_eep_mcs()
+        # estimate once (snr doesn't affect symbol count)
+        eep_sym_total = 0
+        eep_prebuilt = {}
+        for m in MODALITIES:
+            cfg = _build_cfg(m, eep_mcs[m], args.channel, snr_db=snr_list[0], seed=base_seed, drop_bad_frames=drop_bad)
+            n, hdr, payload = _estimate_symbols_for_modality(m, inputs[m], cfg)
+            eep_sym_total += n
+            eep_prebuilt[m] = {"hdr": hdr, "payload": payload, "sym_len": n}
+
+        # 2) Scenario initial MCS
+        if scen == "eep":
+            final_mcs = eep_mcs
+            prebuilt = eep_prebuilt
+            priority = "none"
+        elif scen == "uep_edge":
+            init = _uep_edge_initial()
+            final_mcs, prebuilt = _equal_airtime_adjust(
+                target_total_syms=eep_sym_total, init_mcs=init, inputs=inputs,
+                chan_type=args.channel, snr_db=snr_list[0], seed=base_seed,
+                drop_bad_frames=drop_bad, priority="edge"
+            )
+            priority = "edge"
+        else:  # uep_depth
+            init = _uep_depth_initial()
+            final_mcs, prebuilt = _equal_airtime_adjust(
+                target_total_syms=eep_sym_total, init_mcs=init, inputs=inputs,
+                chan_type=args.channel, snr_db=snr_list[0], seed=base_seed,
+                drop_bad_frames=drop_bad, priority="depth"
+            )
+            priority = "depth"
+
+        # Report equal-airtime check (one-line print)
+        total_syms = sum(prebuilt[m]["sym_len"] for m in MODALITIES) if scen != "eep" else eep_sym_total
+        diff_pct = 100.0 * (total_syms - eep_sym_total) / max(1, eep_sym_total)
+        print(f"[{scen}] Equal-airtime: total_syms={total_syms}, baseline={eep_sym_total}, diff={diff_pct:+.2f}%")
+
+        # 3) Run transmissions for each SNR
+        for snr_db in snr_list:
+            snr_dir = os.path.join(out_root, f"snr_{int(snr_db)}dB")
+            os.makedirs(snr_dir, exist_ok=True)
+            # stable per (snr, modality)
+            records = []
+            for idx, m in enumerate(MODALITIES):
+                # build cfg for this modality
+                seed = base_seed + int(snr_db) * 100 + idx
+                cfg = _build_cfg(m, final_mcs[m], args.channel, snr_db=snr_db, seed=seed, drop_bad_frames=drop_bad)
+
+                # make output dir
+                mdir = os.path.join(snr_dir, m)
+                os.makedirs(mdir, exist_ok=True)
+
+                # run
+                rec = _run_single_transmission(
+                    modality=m,
+                    input_path=inputs[m],
+                    cfg=cfg,
+                    channel=args.channel,
+                    snr_db=snr_db,
+                    out_dir=mdir,
+                    prebuilt_hdr=prebuilt[m]["hdr"] if m in prebuilt else None,
+                    prebuilt_payload=prebuilt[m]["payload"] if m in prebuilt else None,
+                )
+                # add actual symbols used (recalculate here for exactness)
+                # (Symbol count depends only on link/mod, not on channel)
+                cfg_count = _build_cfg(m, final_mcs[m], args.channel, snr_db=snr_db, seed=seed, drop_bad_frames=drop_bad)
+                n_sym, _, _ = _estimate_symbols_for_modality(m, inputs[m], cfg_count)
+                rec["symbols_tx"] = int(n_sym)
+
+                # write per-modality meta
+                meta = {
+                    "scenario": scen, "snr_db": snr_db, "modality": m,
+                    "mcs": final_mcs[m].as_dict(), "symbols_tx": int(n_sym),
+                    "priority": priority
+                }
+                write_json(os.path.join(mdir, "meta.json"), meta)
+
+                # to summary.csv
+                row = [
+                    scen, snr_db, m, rec.get("fec"), rec.get("modulation"), rec.get("interleaver_depth"),
+                    int(rec.get("symbols_tx", n_sym)),
+                    int(rec.get("n_frames", rec.get("frames", 0))),
+                    int(rec.get("n_bad_frames", rec.get("bad_frames", 0))),
+                    bool(rec.get("all_crc_ok", False)),
+                    (None if rec.get("psnr_db") is None else float(rec["psnr_db"])),
+                    rec.get("output_path", ""),
+                ]
+                records.append(row)
+
+            # append to scenario summary CSV
+            with open(summary_csv, "a", newline="") as f:
+                w = csv.writer(f); [w.writerow(r) for r in records]
+
+    print("Done. See outputs under:", os.path.abspath(args.output_root))
+
+if __name__ == "__main__":
+    main()
 
 
 # examples/simulate_image_transmission.py
@@ -2058,3 +2585,6 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
         "orig_bit_lengths": orig_bit_lengths,
     }
     return tx_symbols, tx_meta
+
+
+

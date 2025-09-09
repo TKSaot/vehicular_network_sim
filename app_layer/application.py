@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Literal, Any, Optional
 import numpy as np
 from PIL import Image
+from common.backend import asnumpy
 
 # -------- App header --------
 @dataclass
@@ -441,12 +442,15 @@ def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[
     raise ValueError("Unknown modality in header")
 
 # -------- Save --------
-def save_output(hdr: AppHeader, text_str: str, img_arr: np.ndarray, out_path: str) -> None:
+def save_output(hdr: AppHeader, text_str: str, img_arr, out_path: str) -> None:
     if hdr.modality == "text":
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text_str); return
+            f.write(text_str)
+        return
+
+    arr = asnumpy(img_arr)  # accept CuPy or NumPy and ensure NumPy for PIL
     if hdr.modality in ("edge","depth"):
-        Image.fromarray(img_arr.astype(np.uint8), mode="L").save(out_path, format="PNG"); return
+        Image.fromarray(arr.astype(np.uint8), mode="L").save(out_path, format="PNG"); return
     if hdr.modality == "segmentation":
-        Image.fromarray(img_arr.astype(np.uint8), mode="RGB").save(out_path, format="PNG"); return
+        Image.fromarray(arr.astype(np.uint8), mode="RGB").save(out_path, format="PNG"); return
     raise ValueError("Unsupported modality")

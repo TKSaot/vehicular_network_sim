@@ -1,0 +1,11 @@
+{
+  "modality": "segmentation",
+  "frames": 8199,
+  "bad_frames": 7163,
+  "all_crc_ok": false,
+  "app_header_crc_ok": true,
+  "app_header_recovered_via_majority": false,
+  "app_header_used_mode": "valid",
+  "psnr_db": 25.17990243278958,
+  "output_png": "outputs/20250909-222830__segmentation__rayleigh_fd30_snr10__qpsk__hamming74_hdr7xR5_mapPerm12345_ilv16_mtu512_seed12345/received.png"
+}
