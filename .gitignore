@@ -12,12 +12,13 @@ __pycache__/
 .idea/
 
 # 実行生成物（バックアップは別で取る。履歴は重くしない）
-!outputs/.gitkeep
+# !outputs/.gitkeep
 
 # 大きい/外部配布不可のデータは基本Gitに入れない
 data/
 models/
 checkpoints/
+outputs
 
 # OS
 .DS_Store
