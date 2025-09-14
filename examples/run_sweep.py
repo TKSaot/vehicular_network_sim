@@ -1,52 +1,51 @@
 # examples/run_sweep.py
 from __future__ import annotations
 import os, sys, time, argparse, subprocess
-from tqdm.auto import tqdm
 
-def _run(kind: str, modality: str | None, snr: float, channel: str, extra_env: dict[str,str] | None) -> int:
-    py = sys.executable
+def _run_image(modality: str, snr: float, channel: str, env: dict) -> int:
+    cmd = [sys.executable, "-u", "examples/simulate_image_transmission.py",
+           "--modality", modality, "--channel", channel, "--snr_db", str(snr)]
+    return subprocess.run(cmd, env=env).returncode
+
+def _run_text(snr: float, channel: str, env: dict) -> int:
+    cmd = [sys.executable, "-u", "examples/simulate_text_transmission.py",
+           "--channel", channel, "--snr_db", str(snr)]
+    return subprocess.run(cmd, env=env).returncode
+
+def run_once(modality: str, snr: float, channel: str, use_gpu: bool, show_inner: bool) -> int:
     env = os.environ.copy()
-    env["VC_USE_CUDA"] = env.get("VC_USE_CUDA", "1")  # GPU 既定ON
-    if extra_env:
-        env.update(extra_env)
-    if kind == "image":
-        cmd = [py, "-u", "examples/simulate_image_transmission.py",
-               "--modality", modality, "--channel", channel, "--snr_db", str(snr)]
+    env["VC_USE_CUDA"] = "1" if use_gpu else "0"
+    if show_inner:
+        env["TX_TQDM"] = "1"; env["RX_TQDM"] = "1"
     else:
-        cmd = [py, "-u", "examples/simulate_text_transmission.py",
-               "--channel", channel, "--snr_db", str(snr)]
-    p = subprocess.run(cmd, env=env)
-    return p.returncode
+        env.pop("TX_TQDM", None); env.pop("RX_TQDM", None)
+
+    print(f"\n=== Run: {modality:>12s} @ {snr:>4.1f} dB | {channel} | device={'GPU' if use_gpu else 'CPU'} ===")
+    t0 = time.time()
+    if modality == "text":
+        rc = _run_text(snr, channel, env)
+    else:
+        rc = _run_image(modality, snr, channel, env)
+    dt = time.time() - t0
+    print(f"--- finished ({modality}@{snr} dB) in {dt:.1f}s, rc={rc} ---")
+    return rc
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snrs", type=float, nargs="+", default=[1.0, 12.0])
-    ap.add_argument("--modalities", type=str, nargs="+", default=["edge","depth","segmentation"])
+    # ★ 既定に text を含める
+    ap.add_argument("--modalities", type=str, nargs="+", default=["edge","depth","segmentation","text"])
     ap.add_argument("--channel", type=str, choices=["awgn","rayleigh"], default="rayleigh")
-    ap.add_argument("--fec_preset", type=str, choices=["conv","hamm_robust"], default=os.getenv("FEC_PRESET","conv"))
+    ap.add_argument("--device", type=str, choices=["gpu","cpu"], default="cpu")
+    ap.add_argument("--show_inner", action="store_true", help="TX/RX のフレーム単位 tqdm を表示")
     args = ap.parse_args()
 
-    jobs = []
+    use_gpu = (args.device == "gpu")
+    rc_total = 0
     for m in args.modalities:
-        kind = "image"
         for snr in args.snrs:
-            jobs.append((kind, m, snr))
-
-    bars = []
-    # 各ジョブに独立のプログレスバーを割当
-    for idx, (_, m, snr) in enumerate(jobs):
-        desc = f"{m:12s} @ {snr:>4.1f} dB"
-        bars.append(tqdm(total=1, position=idx, leave=True, desc=desc, unit="run"))
-
-    extra_env = {"FEC_PRESET": args.fec_preset}
-    for idx, (kind, m, snr) in enumerate(jobs):
-        t0 = time.time()
-        rc = _run(kind, m, snr, args.channel, extra_env)
-        dt = time.time() - t0
-        bars[idx].set_postfix_str(f"{args.fec_preset} done in {dt:.1f}s rc={rc}")
-        bars[idx].update(1)
-
-    for b in bars: b.close()
+            rc_total |= run_once(m, snr, args.channel, use_gpu, args.show_inner)
+    sys.exit(rc_total)
 
 if __name__ == "__main__":
     main()
