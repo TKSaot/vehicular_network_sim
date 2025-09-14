@@ -85,7 +85,8 @@ def equalize(rx_symbols, tx_pilot, rx_pilot):
     rp = to_xp(rx_pilot).astype(xp.complex128, copy=False)
 
     mask = xp.abs(tp) > 1e-12
-    if not bool(xp.any(mask)):
+    # CuPy-friendly check (avoid bool(cp.ndarray)):
+    if int(xp.count_nonzero(mask)) == 0:
         return rs, complex(1.0 + 0.0j)
 
     h_hat = xp.mean(rp[mask] / tp[mask])
