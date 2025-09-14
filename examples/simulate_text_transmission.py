@@ -1,10 +1,7 @@
 # examples/simulate_text_transmission.py
 """
-設定は configs/text_config.py に集約。
-最小コマンド:  python examples/simulate_text_transmission.py
-必要なら --snr_db 等だけ上書き。
+EEP(Hamming) 前提のテキスト送受信。configs/text_config.py で設定。
 """
-
 import os, sys, argparse, numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -15,7 +12,7 @@ from common.utils import set_seed
 from common.run_utils import make_output_dir, write_json
 from common.config import SimulationConfig
 from common.byte_mapping import unmap_bytes
-from app_layer.application import serialize_content, AppHeader, deserialize_content, save_output
+from app_layer.application import serialize_content, AppHeader, deserialize_content
 from transmitter.send import build_transmission
 from channel.channel_model import awgn_channel, rayleigh_fading
 from receiver.receive import recover_from_symbols
@@ -44,7 +41,7 @@ def main():
 
     set_seed(cfg.chan.seed)
 
-    # --- TX ---
+    # --- TX: serialize (bytes) ---
     tx_hdr, payload = serialize_content(
         "text", input_path, app_cfg=cfg.app,
         text_encoding="utf-8", validate_image_mode=False
@@ -67,23 +64,15 @@ def main():
     # --- RX ---
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
 
+    # header fallback
     hdr_used_mode = "ok"
-    if not stats.get("app_header_crc_ok", False):
-        if stats.get("app_header_recovered_via_majority", False):
-            hdr_used_mode = "majority"
-        elif cfg.link.force_output_on_hdr_fail:
-            rx_app_hdr_b = tx_hdr.to_bytes()
-            hdr_used_mode = "forced"
-        else:
-            hdr_used_mode = "invalid"
-
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
     except Exception:
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
 
-    # Unmap (inverse of TX permutation)
+    # Unmap (inverse permutation)
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     rx_payload_b = unmap_bytes(
         rx_payload_b,
@@ -93,17 +82,20 @@ def main():
         original_len=rx_hdr.payload_len_bytes
     )
 
-    # Keep undecodable bytes as \xAB sequences so LLM can fix later
+    # Keep undecodable bytes as \xAB (LLM 後処理が容易)
     text_str, _ = deserialize_content(
         rx_hdr, rx_payload_b, app_cfg=cfg.app,
         text_encoding="utf-8", text_errors="backslashreplace"
     )
 
-    # --- Save, metrics ---
+    # --- Save ---
     out_dir = make_output_dir(cfg, modality="text", input_path=input_path, output_root=output_root)
     out_txt = os.path.join(out_dir, "received_text.txt")
-    save_output(rx_hdr, text_str, np.array([]), out_txt)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write(text_str)
 
+    # --- Metrics ---
     orig_text = open(input_path, "r", encoding="utf-8").read()
     recv_text = text_str
     minlen = min(len(orig_text), len(recv_text))
@@ -122,6 +114,7 @@ def main():
         "channel": cfg.chan.channel_type,
         "mod_scheme": cfg.mod.scheme,
         "fec_scheme": cfg.link.fec_scheme,
+        "output_txt": out_txt,
     }
     write_json(os.path.join(out_dir, "rx_stats.json"), report)
 

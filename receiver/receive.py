@@ -33,9 +33,7 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
 
     z = to_xp(rx_symbols)
     ranges = tx_meta["frame_symbol_ranges"]
-    bar = None
-    if _USE_TQDM and _tqdm_rx is not None:
-        bar = _tqdm_rx(total=len(ranges), desc="RX demod+FEC (frames)", unit="frm")
+    bar = _tqdm_rx(total=len(ranges), desc="RX demod+FEC (frames)", unit="frm") if (_USE_TQDM and _tqdm_rx) else None
 
     for i, (start, end) in enumerate(ranges):
         syms = z[start:end]
@@ -57,6 +55,7 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
     if bar is not None:
         bar.close()
 
+    # ★ ここを strong_header=... に統一
     if cfg.link.fec_scheme.lower() == "hamming74":
         raw_frame_bytes = reverse_fec_and_deinterleave_soft(
             frames_bits, frames_rel,
@@ -64,7 +63,7 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
             fec_scheme=cfg.link.fec_scheme,
             repeat_k=cfg.link.repeat_k,
             interleaver_depth=cfg.link.interleaver_depth,
-            strong_header_protection=cfg.link.strong_header_protection,
+            strong_header=cfg.link.strong_header_protection,
             header_copies=cfg.link.header_copies,
             header_rep_k=cfg.link.header_rep_k
         )
@@ -75,7 +74,7 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
             fec_scheme=cfg.link.fec_scheme,
             repeat_k=cfg.link.repeat_k,
             interleaver_depth=cfg.link.interleaver_depth,
-            strong_header_protection=cfg.link.strong_header_protection,
+            strong_header=cfg.link.strong_header_protection,
             header_copies=cfg.link.header_copies,
             header_rep_k=cfg.link.header_rep_k
         )
