@@ -173,9 +173,11 @@ def reverse_fec_and_deinterleave_soft(encoded_frames_bits: List[np.ndarray],
         de_b = block_deinterleave(enc_b, interleaver_depth)
         de_r = _block_deinterleave_generic(enc_r, interleaver_depth)
         if strong_header and header_rep is not None and idx < header_copies:
-            de_b = header_rep.decode(de_b)  # 信頼度は未使用（ハード多数決）
+            de_b = header_rep.decode(de_b)  # 信頼度は未使用
         if fec_scheme.lower() == "hamming74":
             dec = _ham74_decode_chase(de_b, de_r)
+        elif hasattr(fec, "decode_soft"):
+            dec = fec.decode_soft(de_b, de_r)   # ← NEW: conv_k7_* はここを通る
         else:
             dec = fec.decode(de_b)
         Lbits = original_bit_lengths[idx]
@@ -183,6 +185,7 @@ def reverse_fec_and_deinterleave_soft(encoded_frames_bits: List[np.ndarray],
         b = bits_to_bytes(dec)
         out.append(b[: (Lbits + 7)//8])
     return out
+
 
 # ---------- Reassembly ----------
 def _majority_bytes(blobs: List[bytes]) -> bytes:

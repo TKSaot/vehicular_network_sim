@@ -10,7 +10,7 @@ INPUTS = {
     "edge": "examples/edge_00001_.png",
     "depth": "examples/depth_00001_.png",
     "segmentation": "examples/segmentation_00001_.png",
-    "text": "examples/sample.txt",   # ★ 追加（存在しない場合はランナー側で /mnt/data を自動フォールバック）
+    "text": "examples/sample.txt",
 }
 OUTPUT_ROOT = "outputs"
 DEFAULT_MODALITY: Literal["edge","depth","segmentation"] = "segmentation"
@@ -41,10 +41,10 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             ),
         ),
         link=LinkConfig(
-            mtu_bytes=512,
-            interleaver_depth=16,
+            mtu_bytes=256,
+            interleaver_depth=128,
             fec_scheme="hamming74",
-            repeat_k=3,
+            repeat_k=1,                     # note: repeat_k is ignored for hamming74
             strong_header_protection=True,
             header_copies=7,
             header_rep_k=5,
@@ -53,14 +53,14 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
             byte_mapping_scheme="permute",
             byte_mapping_seed=None,
         ),
-        mod=ModulationConfig(scheme="qpsk"),
+        mod=ModulationConfig(scheme="bpsk"),  # robust at very low SNR
         chan=ChannelConfig(
             channel_type="rayleigh",
-            snr_db=10.0,
+            snr_db=10.0,         # override with --snr_db at runtime
             seed=12345,
             doppler_hz=30.0,
             symbol_rate=1e6,
             block_fading=False,
         ),
-        pilot=PilotConfig(preamble_len=32, pilot_len=16),
+        pilot=PilotConfig(preamble_len=32, pilot_len=32),  # longer pilot for stable equalization
     )

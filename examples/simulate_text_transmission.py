@@ -44,11 +44,17 @@ def main():
 
     set_seed(cfg.chan.seed)
 
-    tx_hdr, payload = serialize_content("text", input_path, app_cfg=cfg.app, text_encoding="utf-8", validate_image_mode=False)
+    # --- TX ---
+    tx_hdr, payload = serialize_content(
+        "text", input_path, app_cfg=cfg.app,
+        text_encoding="utf-8", validate_image_mode=False
+    )
     app_hdr_bytes = tx_hdr.to_bytes()
 
+    # --- PHY TX ---
     tx_syms, tx_meta = build_transmission(app_hdr_bytes, payload, cfg)
 
+    # --- Channel ---
     if cfg.chan.channel_type == "awgn":
         rx_syms = awgn_channel(tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed)
     else:
@@ -58,9 +64,10 @@ def main():
             block_fading=cfg.chan.block_fading
         )
 
+    # --- RX ---
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
 
-    hdr_used_mode = "valid"
+    hdr_used_mode = "ok"
     if not stats.get("app_header_crc_ok", False):
         if stats.get("app_header_recovered_via_majority", False):
             hdr_used_mode = "majority"
@@ -69,12 +76,14 @@ def main():
             hdr_used_mode = "forced"
         else:
             hdr_used_mode = "invalid"
+
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
     except Exception:
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
 
+    # Unmap (inverse of TX permutation)
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     rx_payload_b = unmap_bytes(
         rx_payload_b,
@@ -84,8 +93,13 @@ def main():
         original_len=rx_hdr.payload_len_bytes
     )
 
-    text_str, _ = deserialize_content(rx_hdr, rx_payload_b, app_cfg=cfg.app, text_encoding="utf-8", text_errors="replace")
+    # Keep undecodable bytes as \xAB sequences so LLM can fix later
+    text_str, _ = deserialize_content(
+        rx_hdr, rx_payload_b, app_cfg=cfg.app,
+        text_encoding="utf-8", text_errors="backslashreplace"
+    )
 
+    # --- Save, metrics ---
     out_dir = make_output_dir(cfg, modality="text", input_path=input_path, output_root=output_root)
     out_txt = os.path.join(out_dir, "received_text.txt")
     save_output(rx_hdr, text_str, np.array([]), out_txt)
@@ -101,10 +115,13 @@ def main():
         "bad_frames": int(stats["n_bad_frames"]),
         "all_crc_ok": bool(stats["all_crc_ok"]),
         "app_header_crc_ok": bool(stats["app_header_crc_ok"]),
-        "app_header_recovered_via_majority": bool(stats.get("app_header_recovered_via_majority", False)),
-        "app_header_used_mode": hdr_used_mode,
+        "hdr_via_majority": bool(stats.get("app_header_recovered_via_majority", False)),
+        "header_mode": hdr_used_mode,
         "cer_approx": float(cer),
-        "output_text": out_txt,
+        "snr_db": float(cfg.chan.snr_db),
+        "channel": cfg.chan.channel_type,
+        "mod_scheme": cfg.mod.scheme,
+        "fec_scheme": cfg.link.fec_scheme,
     }
     write_json(os.path.join(out_dir, "rx_stats.json"), report)
 
