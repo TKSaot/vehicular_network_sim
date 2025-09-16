@@ -1,3 +1,5 @@
+
+# multimodal_ofdm/metrics.py
 import numpy as np
 
 def psnr(a: np.ndarray, b: np.ndarray, data_range: int = 255) -> float:
