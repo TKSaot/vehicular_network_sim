@@ -6,34 +6,43 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 
 @dataclass
 class AppLayerConfig:
-    # セグメンテーション復元の軽い後処理パラメータ（必要最小限）
+    # --- Segmentation (RX) ---
+    # pre-clean for white-like boundaries (TX also reads this when available)
     seg_white_thresh: int = 250
+    # receiver-side denoise strength
     seg_mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
     seg_iters: int = 2
-    seg_consensus_min_frac: float = 0.6
+    seg_consensus_min_frac: float = 0.6  # majority confidence threshold
     seg_seed: int = 123
+
+    # --- Edge (RX) ---
+    # gentle keeps true thin lines; medium is a touch stronger; strong closes small gaps more aggressively
+    edge_denoise: Literal["none", "gentle", "medium", "strong"] = "gentle"
+    edge_iters: int = 1
+
+    # --- Depth (RX) ---
+    # median3 (3x3) is robust to salt-and-pepper; median5 applies two 3x3 passes roughly equivalent to 5x5
+    depth_denoise: Literal["none", "median3", "median5"] = "median3"
+    depth_iters: int = 1
 
 @dataclass
 class LinkConfig:
-    # FECは Hamming(7,4)，ブロック・インタリーブ固定（UEP/EEP で変更しない）
+    # FEC: Hamming(7,4) + block interleaver (UEP/EEP does not change this)
     mtu_bytes: int = 256
     interleaver_depth: int = 128
-    header_rep_k: int = 5        # ヘッダ繰り返し
-    header_boost_db: float = 6.0 # ヘッダのみ一定増幅（メタデータの保全用）
+    header_rep_k: int = 5
+    header_boost_db: float = 6.0
 
-    # ★ 追加: バイトマッピング
-    # none | permute（乱順）
+    # --- Byte mapping (payload only) ---
     byte_mapping: Literal["none", "permute"] = "permute"
-    # 乱順のシード（モダリティごとに派生させる）
     byte_seed: int = 12345
 
 @dataclass
 class OfdmConfig:
     n_fft: int = 512
-    used_subcarriers: int = 480   # 端とDCは未使用
+    used_subcarriers: int = 480
     cp_len: int = 64
-    pilot_symbol_index: int = 0   # 先頭シンボルをパイロットに
-    # 4モダリティに等分割（UEP/EEPでも固定，UEPは電力だけ変える）
+    pilot_symbol_index: int = 0
     subcarrier_split: Dict[Modal, float] = field(default_factory=lambda: {
         "text": 0.25, "edge": 0.25, "depth": 0.25, "segmentation": 0.25
     })
@@ -46,14 +55,12 @@ class ChannelConfig:
 
 @dataclass
 class PowerConfig:
-    # 線形電力重み（平均電力は内部で正規化）．EEPなら全1．
     weights: Dict[Modal, float] = field(default_factory=lambda: {
         "text": 1.0, "edge": 1.0, "depth": 1.0, "segmentation": 1.0
     })
 
 @dataclass
 class Paths:
-    # 既定はパッケージと同階層の examples/ を参照
     text_path: str = "examples/sample.txt"
     edge_path: str = "examples/edge_00001_.png"
     depth_path: str = "examples/depth_00001_.png"

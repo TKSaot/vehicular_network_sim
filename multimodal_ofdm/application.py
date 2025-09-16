@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional, Any, Tuple
@@ -59,7 +58,7 @@ def _load_image(path: str, mode: str) -> np.ndarray:
     if mode == "RGB" and im.mode != "RGB": im = im.convert("RGB")
     return np.array(im)
 
-# ---- White suppression for segmentation ----
+# ---- White suppression for segmentation (TX pre-clean) ----
 def _white_mask(rgb: np.ndarray, t: int) -> np.ndarray:
     return (rgb[...,0] >= t) & (rgb[...,1] >= t) & (rgb[...,2] >= t)
 
@@ -115,6 +114,124 @@ def _build_seg_ids_and_palette(rgb_arr: np.ndarray, white_thresh: int) -> tuple[
     palette = uniq[nonwhite_idx].astype(np.uint8)
     return ids, palette, enc
 
+# ---------- RX post-processing helpers (new) ----------
+def _shift2d(arr: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Edge-padded shift used throughout; preserves shape."""
+    H, W = arr.shape
+    py0, py1 = (max(dy, 0), max(-dy, 0))
+    px0, px1 = (max(dx, 0), max(-dx, 0))
+    pad = np.pad(arr, ((py0, py1), (px0, px1)), mode="edge")
+    return pad[py1:py1+H, px1:px1+W]
+
+def _neighbors_stack2d(arr: np.ndarray, radius: int = 1) -> np.ndarray:
+    """Stack of (2r+1)^2 shifted arrays including center. shape=(K,H,W)."""
+    outs = []
+    for dy in range(-radius, radius+1):
+        for dx in range(-radius, radius+1):
+            outs.append(_shift2d(arr, dy, dx))
+    return np.stack(outs, axis=0)  # (K,H,W)
+
+def _boundary_mask_ids(ids: np.ndarray) -> np.ndarray:
+    """4-neighborhood boundary pixels in an ID map."""
+    up = _shift2d(ids, -1, 0)
+    dn = _shift2d(ids,  1, 0)
+    lf = _shift2d(ids,  0,-1)
+    rt = _shift2d(ids,  0, 1)
+    return (ids != up) | (ids != dn) | (ids != lf) | (ids != rt)
+
+def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0: return mask
+    acc = mask.copy()
+    for dy in range(-radius, radius+1):
+        for dx in range(-radius, radius+1):
+            if dy == 0 and dx == 0: continue
+            acc |= _shift2d(mask, dy, dx)
+    return acc
+
+def _majority3_ids(ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    3x3 majority (mode) on integer IDs.
+    Returns (mode_ids, mode_count_fraction). No SciPy; fully vectorized.
+    """
+    S = _neighbors_stack2d(ids, radius=1)          # (9,H,W)
+    # counts[i] = how many neighbors equal S[i]
+    eq = (S[:, None, :, :] == S[None, :, :, :])    # (9,9,H,W) boolean
+    counts = eq.sum(axis=0)                         # (9,H,W)
+    best_idx = counts.argmax(axis=0)                # (H,W)
+    best_cnt = counts.max(axis=0).astype(np.float32)
+    mode_ids = np.take_along_axis(S, best_idx[None, :, :], axis=0)[0]
+    frac = best_cnt / 9.0
+    return mode_ids.astype(ids.dtype, copy=False), frac
+
+def _postprocess_seg_ids(ids: np.ndarray,
+                         mode: str = "strong",
+                         iters: int = 2,
+                         tau: float = 0.6) -> np.ndarray:
+    """
+    Boundary-aware interior majority. 3x3 mode with confidence >= tau on interior only.
+    `majority5` and `strong` widen the boundary belt (radius=2) and run more passes.
+    """
+    if mode == "none" or ids.size == 0:
+        return ids
+    belt_r = 1
+    passes = max(1, int(iters))
+    if mode in ("majority5", "strong"):
+        belt_r = 2
+        passes = max(passes, 2)
+        if mode == "strong":
+            tau = min(tau, 0.55)  # slightly easier to flip obvious interiors
+
+    out = ids.copy()
+    for _ in range(passes):
+        B = _dilate_mask(_boundary_mask_ids(out), belt_r)
+        interior = ~B
+        mode_ids, frac = _majority3_ids(out)
+        upd = interior & (frac >= float(tau)) & (mode_ids != out)
+        out = np.where(upd, mode_ids, out)
+    return out
+
+def _denoise_edge_binary(edge: np.ndarray,
+                         level: str = "gentle",
+                         iters: int = 1) -> np.ndarray:
+    """
+    Edge-preserving salt&pepper cleanup for 0/255 binary maps.
+    Removes isolated dots and fills tiny gaps without eating true thin lines.
+    """
+    if edge.size == 0 or level == "none":
+        return edge
+    e = (edge > 0).astype(np.uint8)
+    # thresholds by level (neighbors in 8-NN)
+    if level == "gentle":
+        rm_th, add_th = 1, 7   # remove if <=1 white neighbor; add if >=7 white neighbors
+    elif level == "medium":
+        rm_th, add_th = 2, 6
+    else:  # "strong"
+        rm_th, add_th = 3, 5
+
+    for _ in range(max(1, int(iters))):
+        # 8-neighborhood count
+        neigh = []
+        for dy in (-1,0,1):
+            for dx in (-1,0,1):
+                if dy==0 and dx==0: continue
+                neigh.append(_shift2d(e, dy, dx))
+        cnt = np.sum(neigh, axis=0).astype(np.uint8)  # 0..8
+        # rules
+        remove = (e == 1) & (cnt <= rm_th)
+        add    = (e == 0) & (cnt >= add_th)
+        e = np.where(remove, 0, e)
+        e = np.where(add,    1, e)
+    return (e * 255).astype(np.uint8)
+
+def _median_filter_uint8(img: np.ndarray, radius: int = 1, passes: int = 1) -> np.ndarray:
+    """Pure-numpy sliding median using stack of shifted windows."""
+    out = img.astype(np.uint8, copy=True)
+    K = (2*radius + 1) ** 2
+    for _ in range(max(1, int(passes))):
+        stack = _neighbors_stack2d(out, radius=radius).astype(np.uint8)
+        out = np.median(stack, axis=0).astype(np.uint8)
+    return out
+
 # ---- Serialize/deserialize ----
 def serialize_content(modality: str, path: str, app_cfg: Optional[Any] = None) -> tuple[AppHeader, bytes]:
     if modality == "text":
@@ -141,8 +258,9 @@ def serialize_content(modality: str, path: str, app_cfg: Optional[Any] = None) -
 
     if modality == "segmentation":
         rgb = _load_image(path, "RGB").astype(np.uint8)
-        white_thresh = 250
-        rgb = _suppress_white_boundaries(rgb, white_thresh=white_thresh, iters=2)
+        white_thresh = getattr(app_cfg, "seg_white_thresh", 250) if app_cfg is not None else 250
+        pre_iters    = getattr(app_cfg, "seg_iters", 2) if app_cfg is not None else 2
+        rgb = _suppress_white_boundaries(rgb, white_thresh=white_thresh, iters=int(pre_iters))
         h,w,_ = rgb.shape
         ids, pal, enc = _build_seg_ids_and_palette(rgb, white_thresh=white_thresh)
         _set_palette(pal)
@@ -157,7 +275,6 @@ def serialize_content(modality: str, path: str, app_cfg: Optional[Any] = None) -
     raise ValueError("Unknown modality")
 
 def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int,...], dtype) -> np.ndarray:
-    import numpy as np
     n_expected = 1
     for s in shape: n_expected *= s
     elem = np.dtype(dtype).itemsize
@@ -180,10 +297,22 @@ def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[
     if hdr.modality == "edge":
         arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.uint8)
         arr = (arr >= 128).astype(np.uint8) * 255
+        # --- RX denoise (gentle by default)
+        level = getattr(app_cfg, "edge_denoise", "gentle") if app_cfg is not None else "gentle"
+        iters = getattr(app_cfg, "edge_iters", 1) if app_cfg is not None else 1
+        if level != "none":
+            arr = _denoise_edge_binary(arr, level=level, iters=int(iters))
         return "", arr
 
     if hdr.modality == "depth":
         arr = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.uint8)
+        # --- RX denoise
+        dmode = getattr(app_cfg, "depth_denoise", "median3") if app_cfg is not None else "median3"
+        diters = getattr(app_cfg, "depth_iters", 1) if app_cfg is not None else 1
+        if dmode != "none":
+            r = 1
+            if dmode == "median5": r = 2
+            arr = _median_filter_uint8(arr, radius=r, passes=int(diters))
         return "", arr
 
     if hdr.modality == "segmentation":
@@ -191,6 +320,14 @@ def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[
             ids = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.uint8)
         else:
             ids = _reshape_bytes_safe(payload_bytes, (hdr.height, hdr.width), np.dtype(">u2")).astype(np.uint16)
+
+        # --- RX denoise on IDs (boundary-aware)
+        seg_mode = getattr(app_cfg, "seg_mode", "strong") if app_cfg is not None else "strong"
+        seg_iters = getattr(app_cfg, "seg_iters", 2) if app_cfg is not None else 2
+        seg_tau = getattr(app_cfg, "seg_consensus_min_frac", 0.6) if app_cfg is not None else 0.6
+        if seg_mode != "none":
+            ids = _postprocess_seg_ids(ids, mode=seg_mode, iters=int(seg_iters), tau=float(seg_tau))
+
         pal = _get_palette()
         if pal is None or pal.size == 0:
             K = int(ids.max()) + 1 if ids.size > 0 else 1

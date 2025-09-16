@@ -11,7 +11,7 @@ from .application import (
 from .utils import (
     bytes_to_bits, bits_to_bytes, append_crc32,
     verify_and_strip_crc32, block_deinterleave,
-    permute_bytes, unpermute_bytes, derive_modality_seed,   # ← 追加
+    permute_bytes, unpermute_bytes, derive_modality_seed,
 )
 from .ofdm import assemble_grid
 from .channel import rayleigh_ofdm, awgn_ofdm
@@ -20,7 +20,7 @@ from .presets import POWER_PRESETS
 
 MODS = ["text","edge","depth","segmentation"]
 
-# ---------- helpers ----------
+# ---------- helpers (unchanged) ----------
 def _parse_power_arg(s: str):
     d = {}
     if not s: return d
@@ -96,7 +96,6 @@ def _save_png_uint8(path: str, arr: np.ndarray, modality: str, rx_hdr: AppHeader
     else:
         raise ValueError("unknown modality for saving")
 
-# ---- flatten helpers：C順／F順の両案 ----
 def _flatten_bits_from_cols(cols_complex: np.ndarray, n_need: int) -> tuple[np.ndarray, np.ndarray]:
     R = cols_complex.real
     bC = (R.reshape(-1) >= 0).astype(np.uint8)[:n_need]
@@ -105,14 +104,13 @@ def _flatten_bits_from_cols(cols_complex: np.ndarray, n_need: int) -> tuple[np.n
     if bF.size < n_need: bF = np.pad(bF, (0, n_need - bF.size))
     return bC, bF
 
-# ---- 事後 SNR 推定（BPSK 前提） ----
 def _estimate_snr_db_from_real(r: np.ndarray) -> float:
     r = np.asarray(r, dtype=np.float64).reshape(-1)
     if r.size == 0:
         return 0.0
-    s = np.where(r >= 0, 1.0, -1.0)      # 符号で hard decision
-    proj = r * s                          # ±1 方向への射影
-    mu = float(np.mean(proj))            # 実効振幅の推定
+    s = np.where(r >= 0, 1.0, -1.0)
+    proj = r * s
+    mu = float(np.mean(proj))
     resid = r - s * mu
     var = float(np.var(resid)) if resid.size else 0.0
     if var <= 0:
@@ -132,10 +130,8 @@ def main():
     ap.add_argument("--examples-dir", type=str, default=None)
     ap.add_argument("--out-root", type=str, default=None)
     ap.add_argument("--tag", type=str, default="")
-    # ★ 追加: バイトマッピング指定
-    ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None,
-                    help="override LinkConfig.byte_mapping")
-    ap.add_argument("--byte-seed", type=int, default=None, help="override LinkConfig.byte_seed")
+    ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None)
+    ap.add_argument("--byte-seed", type=int, default=None)
     args = ap.parse_args()
 
     cfg = ExperimentConfig()
@@ -153,18 +149,17 @@ def main():
         "segmentation": _abs_or_join(examples_dir, "segmentation_00001_.png"),
     }
 
-    # --- serialize 全モダリティ ---
+    # --- serialize 全モダリティ（permute はこの後に適用） ---
     hdrs = {}; payloads = {}
     for m in MODS:
-        hdr, pl = serialize_content(m, input_paths[m], app_cfg=None)
+        hdr, pl = serialize_content(m, input_paths[m], app_cfg=cfg.app)  # << pass cfg.app
         hdrs[m] = hdr.to_bytes()
-        # ★ ここで permute（CRC は permuted bytes に対して計算）
         if cfg.link.byte_mapping == "permute":
             seed_m = derive_modality_seed(cfg.link.byte_seed, m)
             pl = permute_bytes(pl, seed_m)
         payloads[m] = append_crc32(pl)
 
-    # --- Power ---
+    # --- Power selection ---
     mode = args.mode.lower()
     preset_name = None
     weights = {m: 1.0 for m in MODS}
@@ -184,7 +179,7 @@ def main():
         mode = "eep" if key == "eep" else "uep"
     s = sum(weights.values()); weights = {k: v*len(MODS)/s for k,v in weights.items()}
 
-    # --- OFDM Grid → Channel → Equalize ---
+    # --- OFDM -> channel -> equalize ---
     X, sc_slices, syms_per_mod = assemble_grid(
         payload_per_mod=payloads,
         header_per_mod=hdrs,
@@ -206,7 +201,7 @@ def main():
     Hhat = np.where(np.abs(Hhat) < 1e-12, 1.0+0j, Hhat)
     Yeq = (Y / Hhat[:, None])
 
-    # --- decode per modality（C/F 自動判定，CRC 使用） ---
+    # --- decode per modality（C/F 自動判定 + CRC） ---
     results = {}
     snr_by_mod = {}
     for m in MODS:
@@ -276,24 +271,24 @@ def main():
                 ok_crc, payload_perm = ok2, payload2
                 order_idx = 1 - order_idx
 
-        # 事後 SNR
+        # post SNR estimate for this modality
         r_pay = pay_cols.real.reshape(-1)
         snr_by_mod[m] = _estimate_snr_db_from_real(r_pay)
 
-        # --- ★ ここで unpermute（CRCは permuted bytes 上で検証済み）
+        # un-permute payload if used
         if cfg.link.byte_mapping == "permute":
             seed_m = derive_modality_seed(cfg.link.byte_seed, m)
             payload_clean = unpermute_bytes(payload_perm, seed_m)
         else:
             payload_clean = payload_perm
 
-        # 画像／テキスト復元
+        # RX application reconstruction (now with app-layer postprocessing)
         try:
             _ = rx_hdr.modality
         except Exception:
             rx_hdr = AppHeader.from_bytes(hdrs[m]); ok_crc = False
 
-        text_str, img_arr = deserialize_content(rx_hdr, payload_clean, app_cfg=None)
+        text_str, img_arr = deserialize_content(rx_hdr, payload_clean, app_cfg=cfg.app)  # << pass cfg.app
         if m != "text":
             Hh, Ww = max(1,int(rx_hdr.height)), max(1,int(rx_hdr.width))
             if not isinstance(img_arr, np.ndarray) or img_arr.size == 0:
@@ -307,7 +302,7 @@ def main():
             "order": "C" if order_idx==0 else "F"
         }
 
-    # --- 出力（フラット配置） ---
+    # --- outputs ---
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     power_tag = _power_tag(weights, preset_name, mode)
     tag_extra = f"__{_slug(args.tag)}" if args.tag else ""
@@ -329,14 +324,20 @@ def main():
     _save_png_uint8(p_seg,   results["segmentation"]["img"], modality="segmentation", rx_hdr=results["segmentation"]["rx_hdr"])
     outputs["edge"] = p_edge; outputs["depth"] = p_depth; outputs["segmentation"] = p_seg
 
-    # --- メトリクス ---
+    # --- metrics ---
     from .application import _load_image
     origs = {
         "edge": _load_image(input_paths["edge"], "L"),
         "depth": _load_image(input_paths["depth"], "L"),
         "segmentation": _load_image(input_paths["segmentation"], "RGB"),
     }
-    ids_true, pal_true, _ = _build_seg_ids_and_palette(_suppress_white_boundaries(origs["segmentation"], 250, 2), 250)
+    # use same white suppression as TX for fairness
+    ids_true, pal_true, _ = _build_seg_ids_and_palette(
+        _suppress_white_boundaries(origs["segmentation"],
+                                   getattr(cfg.app, "seg_white_thresh", 250),
+                                   getattr(cfg.app, "seg_iters", 2)),
+        getattr(cfg.app, "seg_white_thresh", 250)
+    )
 
     e_gt = (origs["edge"] >= 128).astype(np.uint8) * 255
     e_rx = results["edge"]["img"].astype(np.uint8)
