@@ -465,15 +465,17 @@ __all__ = ["awgn_channel", "rayleigh_fading", "equalize"]
 
 def awgn_channel(symbols, snr_db: float, seed: int | None = None):
     """
-    Complex AWGN: SNR is Es/N0．noise variance per complex dimension is N0/2．
-    GPU path (CuPy) if available, else CPU (NumPy).
+    Complex AWGN on GPU if available. SNR is Es/N0 (per complex symbol).
     """
     z = to_xp(symbols).astype(xp.complex128, copy=False)
-    Es = float(xp.mean(xp.abs(z)**2)) if z.size else 1.0
+    if z.size == 0:
+        return z
+    Es = float(xp.mean(xp.abs(z)**2).item())
     snr_lin = 10.0**(snr_db/10.0)
     N0 = Es / snr_lin
+
     if is_cupy:
-        rs = default_rng(seed)  # CuPy RandomState
+        rs = default_rng(seed)
         nr = rs.normal(0, xp.sqrt(N0/2.0), size=z.shape)
         ni = rs.normal(0, xp.sqrt(N0/2.0), size=z.shape)
         noise = (nr + 1j*ni).astype(xp.complex128)
@@ -481,8 +483,8 @@ def awgn_channel(symbols, snr_db: float, seed: int | None = None):
         rng = default_rng(seed)
         nr = rng.normal(0, np.sqrt(N0/2.0), size=z.shape)
         ni = rng.normal(0, np.sqrt(N0/2.0), size=z.shape)
-        noise = (nr + 1j*ni).astype(np.complex128)
-        noise = to_xp(noise)
+        noise = to_xp((nr + 1j*ni).astype(np.complex128))
+
     return (z + noise).astype(xp.complex128)
 
 def rayleigh_fading(symbols,
@@ -493,66 +495,78 @@ def rayleigh_fading(symbols,
                     block_fading: bool = False,
                     snr_reference: str = "rx") -> Tuple["xp.ndarray", "np.ndarray"]:
     """
-    Rayleigh flat fading + AWGN．戻り値は (受信シンボル[xp], フェージング h[n][np])．
-    AR(1) fading is generated on CPU (sequential); the output symbols are returned on GPU if enabled.
+    Rayleigh flat fading + AWGN.
+    * AR(1) fading process h[n] is generated on CPU (NumPy) for stability.
+    * Fading application (z * h) and AWGN addition are done on GPU if available.
+    Returns: (rx_symbols [xp], h[n] [numpy]).
     """
-    x_np = asnumpy(symbols).astype(np.complex128, copy=False)
-    N = x_np.size
-    rng = default_rng(seed) if not is_cupy else np.random.default_rng(seed)  # ensure NumPy on CPU
-
+    z = to_xp(symbols).astype(xp.complex128, copy=False)
+    N = int(z.size)
     if N == 0:
-        return to_xp(x_np), np.ones(0, dtype=np.complex128)
+        return z, np.ones(0, dtype=np.complex128)
 
-    # AR(1) correlation (CPU)
+    # --- CPU: generate h[n] (sequential AR(1)) ---
+    rng = np.random.default_rng(seed)
     Ts = 1.0 / max(1.0, float(symbol_rate))
     fd = abs(float(doppler_hz))
     rho = np.exp(-0.5 * (2*np.pi*fd*Ts)**2)
-    rho = min(0.9999, max(0.0, float(rho)))
+    rho = float(min(0.9999, max(0.0, rho)))
 
     if block_fading:
         h0 = (rng.normal(0, np.sqrt(0.5)) + 1j*rng.normal(0, np.sqrt(0.5)))
-        h = np.ones(N, dtype=np.complex128) * h0
+        h = np.full(N, h0, dtype=np.complex128)
     else:
         v = (rng.normal(0, 1.0, size=N) + 1j*rng.normal(0, 1.0, size=N)) / np.sqrt(2.0)
-        h = np.zeros(N, dtype=np.complex128)
+        h = np.empty(N, dtype=np.complex128)
         h[0] = v[0]
         for n in range(1, N):
             h[n] = rho*h[n-1] + np.sqrt(1 - rho**2)*v[n]
 
-    faded = x_np * h
+    # --- GPU: apply fading & AWGN ---
+    h_gpu = to_xp(h, dtype=xp.complex128)
+    y = (z * h_gpu).astype(xp.complex128)
 
-    # Average SNR calibration (CPU)
-    Es = float(np.mean(np.abs(x_np)**2)) if N else 1.0
+    # Es measured on GPU; average channel power on CPU
+    Es = float(xp.mean(xp.abs(z)**2).item())
     snr_lin = 10.0**(snr_db/10.0)
     gain = float(np.mean(np.abs(h)**2)) if str(snr_reference).lower() == "rx" else 1.0
     N0 = Es * gain / snr_lin
-    nr = rng.normal(0, np.sqrt(N0/2.0), size=N)
-    ni = rng.normal(0, np.sqrt(N0/2.0), size=N)
-    noise = (nr + 1j*ni).astype(np.complex128)
 
-    y = (faded + noise).astype(np.complex128)
-    return to_xp(y), h
+    if is_cupy:
+        rs = default_rng(None if seed is None else seed + 1)
+        nr = rs.normal(0, xp.sqrt(N0/2.0), size=N)
+        ni = rs.normal(0, xp.sqrt(N0/2.0), size=N)
+        noise = (nr + 1j*ni).astype(xp.complex128)
+    else:
+        rng2 = np.random.default_rng(None if seed is None else seed + 1)
+        nr = rng2.normal(0, np.sqrt(N0/2.0), size=N)
+        ni = rng2.normal(0, np.sqrt(N0/2.0), size=N)
+        noise = to_xp((nr + 1j*ni).astype(np.complex128))
+
+    y = (y + noise).astype(xp.complex128)
+    return y, h
 
 def equalize(rx_symbols, tx_pilot, rx_pilot):
     """
-    1 タップ等化．h_hat = mean(rx_pilot / tx_pilot)．
-    Runs on GPU if available．Returns (eq_symbols[xp], h_hat[python complex]).
+    Single-tap equalizer using pilot: ĥ = mean(rx_pilot / tx_pilot).
     """
     rs = to_xp(rx_symbols).astype(xp.complex128, copy=False)
     tp = to_xp(tx_pilot).astype(xp.complex128, copy=False)
     rp = to_xp(rx_pilot).astype(xp.complex128, copy=False)
 
     mask = xp.abs(tp) > 1e-12
-    if not bool(xp.any(mask)):
+    # CuPy-safe check (avoid bool(cp.ndarray))
+    if int(xp.count_nonzero(mask)) == 0:
         return rs, complex(1.0 + 0.0j)
 
     h_hat = xp.mean(rp[mask] / tp[mask])
     eq = rs / (h_hat + 1e-12)
-    # return python complex for logging
+
     try:
         h_hat_py = complex(asnumpy(h_hat).item())
     except Exception:
         h_hat_py = complex(float(xp.real(h_hat)), float(xp.imag(h_hat)))
+
     return eq.astype(xp.complex128), h_hat_py
 
 
@@ -690,114 +704,6 @@ def unmap_bytes(data_rx: bytes, mtu_bytes: int, scheme: str = "none",
         return arr[inv].tobytes()
 
     raise ValueError(f"Unknown byte mapping scheme: {scheme}")
-
-
-"""
-Configuration dataclasses for the vehicular network simulation.
-Now includes per-modality *decoder* options controlled from config.
-"""
-
-from dataclasses import dataclass, field
-from typing import Optional, Literal
-
-# ---------- Decoder options ----------
-@dataclass
-class SegDecoderConfig:
-    # Out-of-range ID fallback at decoder
-    fallback: Literal["uniform", "clamp", "mod"] = "uniform"
-    # Post-filter strength
-    # - "none": no smoothing
-    # - "majority3": 3x3 モード（反復 iters）
-    # - "majority5": 5x5 モード（反復 iters）
-    # - "strong":   5x5 モード + 多数派合意（consensus，min_frac）
-    mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
-    iters: int = 2
-    # consensus：近傍内で同一ラベル率がこの閾値未満なら近傍モードに置換
-    consensus_min_frac: float = 0.6
-    # 乱数を使う処理の種（uniform 代替 ID など）
-    seed: Optional[int] = 123
-
-@dataclass
-class EdgeDecoderConfig:
-    # "none" | "maj3" | "maj5" | "median3" | "median5" |
-    # "open3" | "open5" | "open3close3" | "open5close5"
-    denoise: Literal["none","maj3","maj5","median3","median5","open3","open5","open3close3","open5close5"] = "open3close3"
-    iters: int = 1
-    # Majority のしきい値（未指定なら過半数）
-    thresh: Optional[int] = None
-    # 細線保護：1→0 で線が消えそうな画素は保持
-    preserve_lines: bool = True
-
-@dataclass
-class DepthDecoderConfig:
-    # "none" | "median3" | "median5" | "bilateral5" | "median5_bilateral5"
-    filt: Literal["none","median3","median5","bilateral5","median5_bilateral5"] = "median5_bilateral5"
-    iters: int = 1
-    # bilateral(5x5)
-    sigma_s: float = 1.6
-    sigma_r: float = 12.0
-
-# ---------- App / Link / PHY / Channel ----------
-@dataclass
-class AppConfig:
-    modality: Literal["text", "edge", "depth", "segmentation"] = "text"
-    validate_image_mode: bool = True
-    text_encoding: str = "utf-8"
-    text_errors: str = "replace"
-    # 受信側デコーダ設定
-    segdec: SegDecoderConfig = field(default_factory=SegDecoderConfig)
-    edgedec: EdgeDecoderConfig = field(default_factory=EdgeDecoderConfig)
-    depthdec: DepthDecoderConfig = field(default_factory=DepthDecoderConfig)
-
-@dataclass
-class LinkConfig:
-    mtu_bytes: int = 1024
-    interleaver_depth: int = 16
-    # ★ 802.11p 風畳み込み符号のレート名も選択可能（既定は hamming74 のまま）
-    fec_scheme: Literal[
-        "none", "repeat", "hamming74", "rs255_223",
-        "conv_k7_r12", "conv_k7_r23", "conv_k7_r34"
-    ] = "hamming74"
-    repeat_k: int = 3
-    drop_bad_frames: bool = False
-
-    strong_header_protection: bool = True
-    header_copies: int = 7
-    header_rep_k: int = 5
-    force_output_on_hdr_fail: bool = True
-    verbose: bool = False
-
-    # 送信前のバイトマッピング（フレーム化前の拡散）
-    byte_mapping_scheme: Literal["none", "permute", "frame_block"] = "none"
-    byte_mapping_seed: Optional[int] = None  # None → chan.seed を使用
-
-@dataclass
-class ModulationConfig:
-    scheme: Literal["bpsk", "qpsk", "16qam"] = "qpsk"
-
-@dataclass
-class ChannelConfig:
-    channel_type: Literal["awgn", "rayleigh"] = "rayleigh"
-    snr_db: float = 10.0
-    seed: Optional[int] = 12345
-    doppler_hz: float = 30.0
-    symbol_rate: float = 1e6
-    block_fading: bool = False
-    # （必要なら）snr_reference を channel 側でオプション引数に渡す
-
-@dataclass
-class PilotConfig:
-    preamble_len: int = 32
-    pilot_len: int = 16
-    pilot_every_n_symbols: int = 0
-
-@dataclass
-class SimulationConfig:
-    app: AppConfig = field(default_factory=AppConfig)
-    link: LinkConfig = field(default_factory=LinkConfig)
-    mod: ModulationConfig = field(default_factory=ModulationConfig)
-    chan: ChannelConfig = field(default_factory=ChannelConfig)
-    pilot: PilotConfig = field(default_factory=PilotConfig)
 
 
 # common/run_utils.py
@@ -954,6 +860,7 @@ def psnr(a: np.ndarray, b: np.ndarray, data_range: int = 255) -> float:
 
 # configs/image_config.py
 from __future__ import annotations
+import os
 from typing import Literal
 from common.config import (
     SimulationConfig, AppConfig, LinkConfig, ModulationConfig, ChannelConfig, PilotConfig,
@@ -964,12 +871,81 @@ INPUTS = {
     "edge": "examples/edge_00001_.png",
     "depth": "examples/depth_00001_.png",
     "segmentation": "examples/segmentation_00001_.png",
-    "text": "examples/sample.txt",   # ★ 追加（存在しない場合はランナー側で /mnt/data を自動フォールバック）
+    "text": "examples/sample.txt",
 }
 OUTPUT_ROOT = "outputs"
 DEFAULT_MODALITY: Literal["edge","depth","segmentation"] = "segmentation"
 
+def _eep_link() -> LinkConfig:
+    # Low-SNR robust EEP baseline (BPSK + Hamming74 + deeper ILV + moderate pilots)
+    return LinkConfig(
+        mtu_bytes=256,
+        interleaver_depth=128,
+        fec_scheme="hamming74",
+        repeat_k=1,                     # ignored for hamming74
+        strong_header_protection=True,
+        header_copies=7,
+        header_rep_k=5,
+        force_output_on_hdr_fail=True,
+        verbose=False,
+        byte_mapping_scheme="permute",
+        byte_mapping_seed=None,
+    )
+
+def _mod_cfg() -> ModulationConfig:
+    return ModulationConfig(scheme="bpsk")  # robust for low SNR
+
+def _pilot_cfg() -> PilotConfig:
+    return PilotConfig(preamble_len=32, pilot_len=32)
+
+# ---------- UEP overrides (per modality) ----------
+# Each entry returns (mtu_bytes, interleaver_depth, pilot_len, header_copies)
+UEP_TABLE = {
+    "S": {
+        "text":        (128, 256, 48, 11),
+        "edge":        (192, 192, 48,  9),
+        "segmentation":(192, 192, 48,  9),
+        "depth":       (288, 128, 24,  5),
+    },
+    "G": {
+        "text":        (192, 192, 32,  7),
+        "edge":        (224, 160, 32,  7),
+        "segmentation":(192, 192, 40,  9),
+        "depth":       (192, 256, 48,  9),
+    },
+    "B": {
+        "text":        (160, 224, 40,  9),
+        "edge":        (208, 176, 40,  8),
+        "segmentation":(208, 176, 40,  8),
+        "depth":       (272, 128, 24,  6),
+    },
+}
+
 def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODALITY) -> SimulationConfig:
+    uep_mode = os.getenv("UEP_MODE", "off").strip().upper()
+    link = _eep_link()
+    mod  = _mod_cfg()
+    pilot = _pilot_cfg()
+
+    if uep_mode in UEP_TABLE:
+        if modality not in UEP_TABLE[uep_mode]:
+            raise ValueError(f"Unknown modality for UEP: {modality}")
+        mtu, ilv, pil, hdr = UEP_TABLE[uep_mode][modality]
+        link = LinkConfig(
+            mtu_bytes=mtu,
+            interleaver_depth=ilv,
+            fec_scheme="hamming74",
+            repeat_k=1,
+            strong_header_protection=True,
+            header_copies=hdr,
+            header_rep_k=5,
+            force_output_on_hdr_fail=True,
+            verbose=False,
+            byte_mapping_scheme="permute",
+            byte_mapping_seed=None,
+        )
+        pilot = PilotConfig(preamble_len=32, pilot_len=pil)
+
     return SimulationConfig(
         app=AppConfig(
             modality=modality,
@@ -994,34 +970,23 @@ def build_config(modality: Literal["edge","depth","segmentation"] = DEFAULT_MODA
                 sigma_r=12.0
             ),
         ),
-        link=LinkConfig(
-            mtu_bytes=512,
-            interleaver_depth=16,
-            fec_scheme="hamming74",
-            repeat_k=3,
-            strong_header_protection=True,
-            header_copies=7,
-            header_rep_k=5,
-            force_output_on_hdr_fail=True,
-            verbose=False,
-            byte_mapping_scheme="permute",
-            byte_mapping_seed=None,
-        ),
-        mod=ModulationConfig(scheme="qpsk"),
+        link=link,
+        mod=mod,
         chan=ChannelConfig(
             channel_type="rayleigh",
-            snr_db=10.0,
+            snr_db=10.0,   # override with --snr_db
             seed=12345,
             doppler_hz=30.0,
             symbol_rate=1e6,
             block_fading=False,
         ),
-        pilot=PilotConfig(preamble_len=32, pilot_len=16),
+        pilot=pilot,
     )
 
 
 # configs/text_config.py
 from __future__ import annotations
+import os
 from common.config import (
     SimulationConfig, AppConfig, LinkConfig, ModulationConfig, ChannelConfig, PilotConfig
 )
@@ -1029,33 +994,69 @@ from common.config import (
 INPUT = "examples/sample.txt"
 OUTPUT_ROOT = "outputs"
 
+def _eep_link() -> LinkConfig:
+    return LinkConfig(
+        mtu_bytes=256,
+        interleaver_depth=256,         # deeper for text to disperse bursts
+        fec_scheme="hamming74",
+        repeat_k=1,
+        strong_header_protection=True,
+        header_copies=7,
+        header_rep_k=5,
+        force_output_on_hdr_fail=True,
+        verbose=False,
+        byte_mapping_scheme="permute",
+        byte_mapping_seed=None,
+    )
+
+def _mod_cfg() -> ModulationConfig:
+    return ModulationConfig(scheme="bpsk")
+
+def _pilot_cfg() -> PilotConfig:
+    return PilotConfig(preamble_len=32, pilot_len=32)
+
+UEP_TABLE = {
+    "S": (128, 256, 48, 11),
+    "G": (192, 192, 32,  7),
+    "B": (160, 224, 40,  9),
+}
+
 def build_config() -> SimulationConfig:
-    return SimulationConfig(
-        app=AppConfig(modality="text", validate_image_mode=False),
-        link=LinkConfig(
-            mtu_bytes=1024,
-            interleaver_depth=16,
+    uep_mode = os.getenv("UEP_MODE", "off").strip().upper()
+    link = _eep_link()
+    mod  = _mod_cfg()
+    pilot = _pilot_cfg()
+
+    if uep_mode in UEP_TABLE:
+        mtu, ilv, pil, hdr = UEP_TABLE[uep_mode]
+        link = LinkConfig(
+            mtu_bytes=mtu,
+            interleaver_depth=ilv,
             fec_scheme="hamming74",
-            repeat_k=3,
+            repeat_k=1,
             strong_header_protection=True,
-            header_copies=7,
+            header_copies=hdr,
             header_rep_k=5,
             force_output_on_hdr_fail=True,
             verbose=False,
-            # NEW (keep off for text):
-            byte_mapping_scheme="none",
+            byte_mapping_scheme="permute",
             byte_mapping_seed=None,
-        ),
-        mod=ModulationConfig(scheme="qpsk"),
+        )
+        pilot = PilotConfig(preamble_len=32, pilot_len=pil)
+
+    return SimulationConfig(
+        app=AppConfig(modality="text", validate_image_mode=False),
+        link=link,
+        mod=mod,
         chan=ChannelConfig(
-            channel_type="awgn",         # 初回安定実行
-            snr_db=12.0,
+            channel_type="rayleigh",
+            snr_db=12.0,   # override with --snr_db
             seed=12345,
-            doppler_hz=50.0,
+            doppler_hz=30.0,
             symbol_rate=1e6,
             block_fading=False,
         ),
-        pilot=PilotConfig(preamble_len=32, pilot_len=16),
+        pilot=pilot,
     )
 
 
@@ -1234,9 +1235,11 @@ def reverse_fec_and_deinterleave_soft(encoded_frames_bits: List[np.ndarray],
         de_b = block_deinterleave(enc_b, interleaver_depth)
         de_r = _block_deinterleave_generic(enc_r, interleaver_depth)
         if strong_header and header_rep is not None and idx < header_copies:
-            de_b = header_rep.decode(de_b)  # 信頼度は未使用（ハード多数決）
+            de_b = header_rep.decode(de_b)  # 信頼度は未使用
         if fec_scheme.lower() == "hamming74":
             dec = _ham74_decode_chase(de_b, de_r)
+        elif hasattr(fec, "decode_soft"):
+            dec = fec.decode_soft(de_b, de_r)   # ← NEW: conv_k7_* はここを通る
         else:
             dec = fec.decode(de_b)
         Lbits = original_bit_lengths[idx]
@@ -1244,6 +1247,7 @@ def reverse_fec_and_deinterleave_soft(encoded_frames_bits: List[np.ndarray],
         b = bits_to_bytes(dec)
         out.append(b[: (Lbits + 7)//8])
     return out
+
 
 # ---------- Reassembly ----------
 def _majority_bytes(blobs: List[bytes]) -> bytes:
@@ -1289,22 +1293,19 @@ def reassemble_and_check(frames_bytes: List[bytes], header_copies: int = 1,
     return hdr_payload, bytes(data), stats
 
 
-"""
-Error correction schemes:
-- None
-- Repetition (k)
-- Hamming(7,4)
-- Reed-Solomon(255,223)  [optional]
-- NEW: Convolutional K=7 (g0=133_o, g1=171_o) with puncturing: R=1/2, 2/3, 3/4
-
-All operate on bit arrays (0/1) and return bit arrays.
-"""
-
+# ==========================
+# ./data_link_layer/error_correction.py
+# ==========================
+# Error correction schemes:
+#   None / Repeat / Hamming(7,4) / RS(255,223)
+#   NEW: Conv(K=7) with vectorized hard/soft Viterbi (GPU optional)
+# ==========================
 from __future__ import annotations
 import numpy as np
 from typing import Optional
+from common.backend import xp, to_xp, asnumpy
 
-# ----------------- Base -----------------
+# ---------- Base ----------
 class FECBase:
     name = "base"
     code_rate = 1.0
@@ -1313,12 +1314,12 @@ class FECBase:
     def decode(self, bits: np.ndarray) -> np.ndarray:
         return np.asarray(bits, dtype=np.uint8)
 
-# ----------------- None -----------------
+# ---------- None ----------
 class NoFEC(FECBase):
     name = "none"
     code_rate = 1.0
 
-# ----------------- Repetition -----------------
+# ---------- Repetition ----------
 class RepetitionFEC(FECBase):
     def __init__(self, k: int = 3):
         assert k >= 1 and isinstance(k, int)
@@ -1336,24 +1337,19 @@ class RepetitionFEC(FECBase):
         s = np.sum(grp, axis=1)
         return (s >= (self.k // 2 + 1)).astype(np.uint8)
 
-# ----------------- Hamming(7,4) -----------------
+# ---------- Hamming(7,4) ----------
 class Hamming74FEC(FECBase):
     """
     Systematic Hamming(7,4) with codeword [d1 d2 d3 d4 p1 p2 p3]
-    p1 = d1 ^ d2 ^ d4
-    p2 = d1 ^ d3 ^ d4
-    p3 = d2 ^ d3 ^ d4
+    p1 = d1 ^ d2 ^ d4; p2 = d1 ^ d3 ^ d4; p3 = d2 ^ d3 ^ d4
     """
     name = "hamming74"
     code_rate = 4/7
-
     def encode(self, bits: np.ndarray) -> np.ndarray:
         b = np.asarray(bits, dtype=np.uint8).reshape(-1)
         pad = (-len(b)) % 4
-        if pad:
-            b = np.concatenate([b, np.zeros(pad, dtype=np.uint8)])
-        if len(b) == 0:
-            return b
+        if pad: b = np.concatenate([b, np.zeros(pad, dtype=np.uint8)])
+        if len(b) == 0: return b
         D = b.reshape(-1, 4)
         d1, d2, d3, d4 = D[:,0], D[:,1], D[:,2], D[:,3]
         p1 = (d1 ^ d2 ^ d4).astype(np.uint8)
@@ -1361,208 +1357,256 @@ class Hamming74FEC(FECBase):
         p3 = (d2 ^ d3 ^ d4).astype(np.uint8)
         C = np.stack([d1, d2, d3, d4, p1, p2, p3], axis=1)
         return C.reshape(-1)
-
     def decode(self, bits: np.ndarray) -> np.ndarray:
         c = np.asarray(bits, dtype=np.uint8).reshape(-1)
         L = (len(c) // 7) * 7
         c = c[:L]
-        if L == 0:
-            return np.zeros(0, dtype=np.uint8)
+        if L == 0: return np.zeros(0, dtype=np.uint8)
         C = c.reshape(-1, 7)
-        d1, d2, d3, d4, p1, p2, p3 = [C[:,i] for i in range(7)]
+        d1,d2,d3,d4,p1,p2,p3 = [C[:,i] for i in range(7)]
         s1 = (d1 ^ d2 ^ d4 ^ p1).astype(np.uint8)
         s2 = (d1 ^ d3 ^ d4 ^ p2).astype(np.uint8)
         s3 = (d2 ^ d3 ^ d4 ^ p3).astype(np.uint8)
-        synd_val = (s1 + (s2 << 1) + (s3 << 2)).astype(np.uint8)
-        map_arr = np.array([0,5,6,1,7,2,3,4], dtype=np.uint8)  # pos map (1-based)
-        err_pos = map_arr[synd_val]
+        synd = (s1 + (s2<<1) + (s3<<2)).astype(np.uint8)
+        pos_map = np.array([0,5,6,1,7,2,3,4], dtype=np.uint8)
+        err_pos = pos_map[synd]
         for i in range(C.shape[0]):
-            pos = int(err_pos[i])
-            if pos != 0:
-                C[i, pos-1] ^= 1
-        data = C[:, :4].reshape(-1)
-        return data
+            p = int(err_pos[i])
+            if p != 0:
+                C[i, p-1] ^= 1
+        return C[:, :4].reshape(-1)
 
-# ----------------- Reed-Solomon(255,223) optional -----------------
+# ---------- RS(255,223) (optional) ----------
 class RS255223FEC(FECBase):
-    """
-    Byte-oriented RS(255,223) over GF(256). Requires 'reedsolo'.
-    """
     name = "rs255_223"
     code_rate = 223/255
-
     def __init__(self):
         try:
             import reedsolo  # type: ignore
         except Exception as e:
-            raise ImportError("reedsolo package is required for RS255_223 FEC. Install via: pip install reedsolo") from e
-        self.rs = reedsolo.RSCodec(32)  # n-k = 32 parity bytes
-
+            raise ImportError("reedsolo is required for RS255_223 (pip install reedsolo)") from e
+        self.rs = reedsolo.RSCodec(32)
     def encode(self, bits: np.ndarray) -> np.ndarray:
         from common.utils import bits_to_bytes, bytes_to_bits
-        data_bytes = bits_to_bytes(bits)
-        if len(data_bytes) % 223 != 0:
-            pad = 223 - (len(data_bytes) % 223)
-            data_bytes += bytes([0])*pad
+        data = bits_to_bytes(bits)
+        if len(data) % 223 != 0:
+            data += bytes([0]) * (223 - (len(data) % 223))
         out = bytearray()
-        for i in range(0, len(data_bytes), 223):
-            out.extend(self.rs.encode(data_bytes[i:i+223]))
+        for i in range(0, len(data), 223):
+            out.extend(self.rs.encode(data[i:i+223]))
         return bytes_to_bits(bytes(out))
-
     def decode(self, bits: np.ndarray) -> np.ndarray:
         from common.utils import bits_to_bytes, bytes_to_bits
-        data_bytes = bits_to_bytes(bits)
-        L = (len(data_bytes) // 255) * 255
-        data_bytes = data_bytes[:L]
+        data = bits_to_bytes(bits)
+        L = (len(data) // 255) * 255
+        data = data[:L]
         out = bytearray()
-        for i in range(0, len(data_bytes), 255):
-            block = data_bytes[i:i+255]
+        for i in range(0, len(data), 255):
+            block = data[i:i+255]
             try:
-                dec = self.rs.decode(block)  # -> 223 bytes
+                dec = self.rs.decode(block)
             except Exception:
-                dec = bytes([0])*223
+                dec = bytes([0]) * 223
             out.extend(dec)
         return bytes_to_bits(bytes(out))
 
-# ----------------- NEW: Convolutional (K=7) with puncturing -----------------
+# ---------- NEW: Conv(K=7) vectorized hard/soft Viterbi ----------
 class ConvK7FEC(FECBase):
     """
-    Rate-1/2 mother code with K=7 (g0=133_o, g1=171_o) + puncturing:
+    Mother code (K=7, m=6) with generators g0=133_o, g1=171_o.
+    Puncturing:
       R=1/2: p0=[1],        p1=[1]
       R=2/3: p0=[1,1,0],    p1=[1,0,1]
       R=3/4: p0=[1,1,0,1],  p1=[1,0,1,1]
-    Hard-decision Viterbi (64 states). Zero termination (m=6).
+    Provides:
+      - encode(bits)  -> np.uint8 coded bits
+      - decode(bits)  -> np.uint8 hard-decision Viterbi (vectorized)
+      - decode_soft(hard_bits, rel_bits) -> np.uint8 soft-aided Viterbi (uses per-coded-bit reliabilities)
     """
     def __init__(self, rate: str = "1/2"):
-        rate = str(rate).lower().replace("r","").replace("_","/")
-        if rate in ("1/2", "12"):
-            p0, p1 = [1], [1]; R = 1/2; self.name = "conv_k7_r12"
-        elif rate in ("2/3", "23"):
-            p0, p1 = [1,1,0], [1,0,1]; R = 2/3; self.name = "conv_k7_r23"
-        elif rate in ("3/4", "34"):
-            p0, p1 = [1,1,0,1], [1,0,1,1]; R = 3/4; self.name = "conv_k7_r34"
+        rate = str(rate).lower().replace("r","").replace("_","/").replace(" ", "")
+        if rate in ("1/2","12"):
+            self.p0, self.p1 = [1], [1]; self.name = "conv_k7_r12"; self.code_rate = 1/2
+        elif rate in ("2/3","23"):
+            self.p0, self.p1 = [1,1,0], [1,0,1]; self.name = "conv_k7_r23"; self.code_rate = 2/3
+        elif rate in ("3/4","34"):
+            self.p0, self.p1 = [1,1,0,1], [1,0,1,1]; self.name = "conv_k7_r34"; self.code_rate = 3/4
         else:
-            raise ValueError(f"Unsupported conv. rate: {rate}")
-        self.p0 = np.array(p0, dtype=np.uint8)
-        self.p1 = np.array(p1, dtype=np.uint8)
-        self.period = len(p0)
-        self.code_rate = float(R)
-
+            raise ValueError(f"Unsupported rate: {rate}")
+        self.P = len(self.p0)
         self.m = 6
         self.K = 7
+        self.S = 1 << self.m
         self.g0 = 0o133
         self.g1 = 0o171
 
-        S = 1 << self.m
-        self.next_state = np.zeros((S, 2), dtype=np.int32)
-        self.out0 = np.zeros((S, 2), dtype=np.uint8)
-        self.out1 = np.zeros((S, 2), dtype=np.uint8)
-        for s in range(S):
-            for u in (0, 1):
+        # Precompute trellis tables on CPU (small)
+        self.next_state = np.zeros((self.S, 2), dtype=np.int16)
+        self.out0 = np.zeros((self.S, 2), dtype=np.uint8)
+        self.out1 = np.zeros((self.S, 2), dtype=np.uint8)
+        for s in range(self.S):
+            for u in (0,1):
                 reg = (u << self.m) | s
                 y0 = bin(reg & self.g0).count("1") & 1
                 y1 = bin(reg & self.g1).count("1") & 1
                 ns = (s >> 1) | (u << (self.m - 1))
-                self.next_state[s, u] = ns
-                self.out0[s, u] = y0
-                self.out1[s, u] = y1
+                self.next_state[s,u] = ns
+                self.out0[s,u] = y0
+                self.out1[s,u] = y1
 
+        # Invert trellis: for each ns, two (prev_state, input_bit) pairs
+        prev0 = np.zeros(self.S, dtype=np.int16)
+        prev1 = np.zeros(self.S, dtype=np.int16)
+        inb0  = np.zeros(self.S, dtype=np.uint8)
+        inb1  = np.zeros(self.S, dtype=np.uint8)
+        out0a = np.zeros(self.S, dtype=np.uint8)
+        out1a = np.zeros(self.S, dtype=np.uint8)
+        out0b = np.zeros(self.S, dtype=np.uint8)
+        out1b = np.zeros(self.S, dtype=np.uint8)
+        fill = np.zeros(self.S, dtype=np.uint8)
+        for ps in range(self.S):
+            for u in (0,1):
+                ns = int(self.next_state[ps,u])
+                if fill[ns] == 0:
+                    prev0[ns] = ps; inb0[ns] = u; out0a[ns] = self.out0[ps,u]; out1a[ns] = self.out1[ps,u]; fill[ns] = 1
+                else:
+                    prev1[ns] = ps; inb1[ns] = u; out0b[ns] = self.out0[ps,u]; out1b[ns] = self.out1[ps,u]
+        self.prev0 = prev0; self.prev1 = prev1
+        self.inb0  = inb0;  self.inb1  = inb1
+        self.o0a   = out0a; self.o1a   = out1a
+        self.o0b   = out0b; self.o1b   = out1b
+
+    # --- Encoding (simple & fast enough) ---
     def encode(self, bits: np.ndarray) -> np.ndarray:
         b = np.asarray(bits, dtype=np.uint8).reshape(-1)
-        s = 0
-        y0_list, y1_list = [], []
+        s = 0; y0_list=[]; y1_list=[]
         for u in b:
-            y0 = int(self.out0[s, int(u)]); y1 = int(self.out1[s, int(u)])
+            u = int(u)
+            y0 = int(self.out0[s,u]); y1 = int(self.out1[s,u])
             y0_list.append(y0); y1_list.append(y1)
-            s = int(self.next_state[s, int(u)])
+            s = int(self.next_state[s,u])
         for _ in range(self.m):  # zero-termination
-            y0 = int(self.out0[s, 0]); y1 = int(self.out1[s, 0])
+            y0 = int(self.out0[s,0]); y1 = int(self.out1[s,0])
             y0_list.append(y0); y1_list.append(y1)
-            s = int(self.next_state[s, 0])
-
+            s = int(self.next_state[s,0])
+        # puncture
         out = []
-        P = self.period
         for t in range(len(y0_list)):
-            if self.p0[t % P]: out.append(y0_list[t])
-            if self.p1[t % P]: out.append(y1_list[t])
+            if self.p0[t % self.P]: out.append(y0_list[t])
+            if self.p1[t % self.P]: out.append(y1_list[t])
         return np.array(out, dtype=np.uint8)
 
-    def _depuncture_to_pairs(self, bits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        r = np.asarray(bits, dtype=np.uint8).reshape(-1)
-        obs0, obs1 = [], []
-        i = 0; P = self.period
+    # --- Helper: depuncture to two streams (obs, and optional weights) ---
+    def _depuncture_pairs(self, obs_bits: np.ndarray, rel_bits: Optional[np.ndarray] = None):
+        r = np.asarray(obs_bits, dtype=np.uint8).reshape(-1)
+        has_rel = rel_bits is not None
+        if has_rel:
+            w = np.asarray(rel_bits, dtype=np.float32).reshape(-1)
+        P = self.P
+        o0 = []; o1 = []; w0 = []; w1 = []
+        i = 0
         while i < len(r):
-            if self.p0[len(obs0) % P]:
-                b0 = int(r[i]) if i < len(r) else -1; i += 1
+            if self.p0[len(o0) % P]:
+                o0.append(int(r[i])); w0.append(float(w[i]) if has_rel else 1.0); i += 1
             else:
-                b0 = -1
-            if self.p1[len(obs1) % P]:
-                b1 = int(r[i]) if i < len(r) else -1; i += 1
+                o0.append(-1); w0.append(0.0)
+            if self.p1[len(o1) % P]:
+                o1.append(int(r[i])); w1.append(float(w[i]) if has_rel else 1.0); i += 1
             else:
-                b1 = -1
-            obs0.append(b0); obs1.append(b1)
-        return np.array(obs0, dtype=np.int16), np.array(obs1, dtype=np.int16)
+                o1.append(-1); w1.append(0.0)
+        return np.array(o0, dtype=np.int16), np.array(o1, dtype=np.int16), \
+               np.array(w0, dtype=np.float32), np.array(w1, dtype=np.float32)
 
-    def decode(self, bits: np.ndarray) -> np.ndarray:
-        obs0, obs1 = self._depuncture_to_pairs(bits)
-        T = int(len(obs0)); S = 1 << self.m; INF = 10**9
-        pm = np.full(S, INF, dtype=np.int64); pm[0] = 0
-        prev_state = np.full((T, S), -1, dtype=np.int16)
-        prev_bit   = np.zeros((T, S), dtype=np.uint8)
+    # --- Vectorized forward pass (hard or weighted-soft) ---
+    def _viterbi_forward(self, o0, o1, w0, w1):
+        # move to backend
+        prev0 = to_xp(self.prev0); prev1 = to_xp(self.prev1)
+        inb0  = to_xp(self.inb0);  inb1  = to_xp(self.inb1)
+        o0a   = to_xp(self.o0a);   o1a   = to_xp(self.o1a)
+        o0b   = to_xp(self.o0b);   o1b   = to_xp(self.o1b)
+
+        T = int(len(o0)); S = self.S
+        INF = xp.float32(1e9)
+
+        pm = xp.full(S, INF, dtype=xp.float32); pm[0] = 0.0  # start from state 0
+        prev_state = xp.empty((T, S), dtype=xp.uint8)  # store predecessors
+        prev_bit   = xp.empty((T, S), dtype=xp.uint8)
+
+        # Prepare obs/weights on backend
+        o0x = to_xp(o0); o1x = to_xp(o1); w0x = to_xp(w0); w1x = to_xp(w1)
 
         for t in range(T):
-            new_pm = np.full(S, INF, dtype=np.int64)
-            o0, o1 = int(obs0[t]), int(obs1[t])
-            for ps in range(S):
-                m0 = pm[ps]
-                if m0 >= INF: continue
-                for u in (0,1):
-                    ns = int(self.next_state[ps, u])
-                    y0 = int(self.out0[ps, u]); y1 = int(self.out1[ps, u])
-                    dist = 0
-                    if o0 != -1: dist += (o0 ^ y0)
-                    if o1 != -1: dist += (o1 ^ y1)
-                    cost = m0 + dist
-                    if cost < new_pm[ns]:
-                        new_pm[ns] = cost
-                        prev_state[t, ns] = ps
-                        prev_bit[t, ns] = u
+            # costs from two predecessor branches into each next state
+            # mismatch cost: weight * XOR(predicted, observed); punctured -> weight=0
+            obs0 = o0x[t]; obs1 = o1x[t]
+            ww0  = w0x[t]; ww1  = w1x[t]
+
+            # Branch A
+            cA = pm[prev0]
+            if int(obs0) != -1:
+                cA = cA + ww0 * xp.abs(o0a - obs0)
+            if int(obs1) != -1:
+                cA = cA + ww1 * xp.abs(o1a - obs1)
+
+            # Branch B
+            cB = pm[prev1]
+            if int(obs0) != -1:
+                cB = cB + ww0 * xp.abs(o0b - obs0)
+            if int(obs1) != -1:
+                cB = cB + ww1 * xp.abs(o1b - obs1)
+
+            chooseA = cA <= cB
+            new_pm = xp.where(chooseA, cA, cB)
+            prev_state[t,:] = xp.where(chooseA, prev0, prev1).astype(xp.uint8)
+            prev_bit[t,:]   = xp.where(chooseA, inb0,  inb1).astype(xp.uint8)
             pm = new_pm
 
-        end_state = 0 if pm[0] < INF else int(np.argmin(pm))
-        s = end_state
-        bits_rev = []
-        for t in range(T - 1, -1, -1):
-            u = int(prev_bit[t, s])
-            bits_rev.append(u)
-            s = int(prev_state[t, s])
-            if s < 0: s = 0
-        seq = bits_rev[::-1]
-        if len(seq) >= self.m:
-            seq = seq[:len(seq) - self.m]
-        return np.array(seq, dtype=np.uint8)
+        return pm, prev_state, prev_bit
 
-# ----------------- Factory -----------------
+    def _backtrack(self, pm, prev_state, prev_bit):
+        # End at state 0 if possible (zero-termination), else best state
+        end_state = int(xp.argmin(pm).item())
+        s = end_state
+        T = prev_bit.shape[0]
+        out_bits = []
+        # backtrack on CPU (cheap) for portability
+        PS = asnumpy(prev_state)
+        PB = asnumpy(prev_bit)
+        for t in range(T-1, -1, -1):
+            u = int(PB[t, s]); out_bits.append(u); s = int(PS[t, s])
+        out_bits = out_bits[::-1]
+        # remove tail bits (m)
+        if len(out_bits) >= self.m:
+            out_bits = out_bits[:len(out_bits) - self.m]
+        return np.array(out_bits, dtype=np.uint8)
+
+    # --- Public decoders ---
+    def decode(self, bits: np.ndarray) -> np.ndarray:
+        # hard-decision: unit weights for non-punctured bits
+        o0, o1, w0, w1 = self._depuncture_pairs(bits, rel_bits=None)
+        pm, ps, pb = self._viterbi_forward(o0, o1, w0, w1)
+        return self._backtrack(pm, ps, pb)
+
+    def decode_soft(self, hard_bits: np.ndarray, rel_bits: np.ndarray) -> np.ndarray:
+        # soft-aided: weights = reliability; still uses hard observed bits, but weighted
+        o0, o1, w0, w1 = self._depuncture_pairs(hard_bits, rel_bits)
+        pm, ps, pb = self._viterbi_forward(o0, o1, w0, w1)
+        return self._backtrack(pm, ps, pb)
+
+# ---------- Factory ----------
 def make_fec(scheme: str, repeat_k: int = 3) -> FECBase:
     s = scheme.lower()
-    if s == "none":
-        return NoFEC()
-    if s == "repeat":
-        return RepetitionFEC(k=repeat_k)
-    if s == "hamming74":
-        return Hamming74FEC()
+    if s == "none":          return NoFEC()
+    if s == "repeat":        return RepetitionFEC(k=repeat_k)
+    if s == "hamming74":     return Hamming74FEC()
     if s == "rs255_223":
-        try:
-            return RS255223FEC()
+        try: return RS255223FEC()
         except ImportError:
             print("[WARN] RS255_223 selected but 'reedsolo' not installed. Falling back to NoFEC.")
             return NoFEC()
-    if s in ("conv_k7_r12", "convk7_r12", "conv_k7_1_2"):
-        return ConvK7FEC(rate="1/2")
-    if s in ("conv_k7_r23", "convk7_r23", "conv_k7_2_3"):
-        return ConvK7FEC(rate="2/3")
-    if s in ("conv_k7_r34", "convk7_r34", "conv_k7_3_4"):
-        return ConvK7FEC(rate="3/4")
+    if s in ("conv_k7_r12","convk7_r12","conv_k7_1_2"): return ConvK7FEC(rate="1/2")
+    if s in ("conv_k7_r23","convk7_r23","conv_k7_2_3"): return ConvK7FEC(rate="2/3")
+    if s in ("conv_k7_r34","convk7_r34","conv_k7_3_4"): return ConvK7FEC(rate="3/4")
     raise ValueError(f"Unknown FEC scheme: {scheme}")
 
 
@@ -1706,11 +1750,8 @@ if __name__ == "__main__":
 
 # examples/simulate_text_transmission.py
 """
-設定は configs/text_config.py に集約。
-最小コマンド:  python examples/simulate_text_transmission.py
-必要なら --snr_db 等だけ上書き。
+EEP(Hamming) 前提のテキスト送受信。configs/text_config.py で設定。
 """
-
 import os, sys, argparse, numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -1721,7 +1762,7 @@ from common.utils import set_seed
 from common.run_utils import make_output_dir, write_json
 from common.config import SimulationConfig
 from common.byte_mapping import unmap_bytes
-from app_layer.application import serialize_content, AppHeader, deserialize_content, save_output
+from app_layer.application import serialize_content, AppHeader, deserialize_content
 from transmitter.send import build_transmission
 from channel.channel_model import awgn_channel, rayleigh_fading
 from receiver.receive import recover_from_symbols
@@ -1750,11 +1791,17 @@ def main():
 
     set_seed(cfg.chan.seed)
 
-    tx_hdr, payload = serialize_content("text", input_path, app_cfg=cfg.app, text_encoding="utf-8", validate_image_mode=False)
+    # --- TX: serialize (bytes) ---
+    tx_hdr, payload = serialize_content(
+        "text", input_path, app_cfg=cfg.app,
+        text_encoding="utf-8", validate_image_mode=False
+    )
     app_hdr_bytes = tx_hdr.to_bytes()
 
+    # --- PHY TX ---
     tx_syms, tx_meta = build_transmission(app_hdr_bytes, payload, cfg)
 
+    # --- Channel ---
     if cfg.chan.channel_type == "awgn":
         rx_syms = awgn_channel(tx_syms, cfg.chan.snr_db, seed=cfg.chan.seed)
     else:
@@ -1764,23 +1811,18 @@ def main():
             block_fading=cfg.chan.block_fading
         )
 
+    # --- RX ---
     rx_app_hdr_b, rx_payload_b, stats = recover_from_symbols(rx_syms, tx_meta, cfg)
 
-    hdr_used_mode = "valid"
-    if not stats.get("app_header_crc_ok", False):
-        if stats.get("app_header_recovered_via_majority", False):
-            hdr_used_mode = "majority"
-        elif cfg.link.force_output_on_hdr_fail:
-            rx_app_hdr_b = tx_hdr.to_bytes()
-            hdr_used_mode = "forced"
-        else:
-            hdr_used_mode = "invalid"
+    # header fallback
+    hdr_used_mode = "ok"
     try:
         rx_hdr = AppHeader.from_bytes(rx_app_hdr_b)
     except Exception:
         rx_hdr = tx_hdr
         hdr_used_mode = "forced-parse-failed"
 
+    # Unmap (inverse permutation)
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     rx_payload_b = unmap_bytes(
         rx_payload_b,
@@ -1790,12 +1832,20 @@ def main():
         original_len=rx_hdr.payload_len_bytes
     )
 
-    text_str, _ = deserialize_content(rx_hdr, rx_payload_b, app_cfg=cfg.app, text_encoding="utf-8", text_errors="replace")
+    # Keep undecodable bytes as \xAB (LLM 後処理が容易)
+    text_str, _ = deserialize_content(
+        rx_hdr, rx_payload_b, app_cfg=cfg.app,
+        text_encoding="utf-8", text_errors="backslashreplace"
+    )
 
+    # --- Save ---
     out_dir = make_output_dir(cfg, modality="text", input_path=input_path, output_root=output_root)
     out_txt = os.path.join(out_dir, "received_text.txt")
-    save_output(rx_hdr, text_str, np.array([]), out_txt)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write(text_str)
 
+    # --- Metrics ---
     orig_text = open(input_path, "r", encoding="utf-8").read()
     recv_text = text_str
     minlen = min(len(orig_text), len(recv_text))
@@ -1807,10 +1857,14 @@ def main():
         "bad_frames": int(stats["n_bad_frames"]),
         "all_crc_ok": bool(stats["all_crc_ok"]),
         "app_header_crc_ok": bool(stats["app_header_crc_ok"]),
-        "app_header_recovered_via_majority": bool(stats.get("app_header_recovered_via_majority", False)),
-        "app_header_used_mode": hdr_used_mode,
+        "hdr_via_majority": bool(stats.get("app_header_recovered_via_majority", False)),
+        "header_mode": hdr_used_mode,
         "cer_approx": float(cer),
-        "output_text": out_txt,
+        "snr_db": float(cfg.chan.snr_db),
+        "channel": cfg.chan.channel_type,
+        "mod_scheme": cfg.mod.scheme,
+        "fec_scheme": cfg.link.fec_scheme,
+        "output_txt": out_txt,
     }
     write_json(os.path.join(out_dir, "rx_stats.json"), report)
 
@@ -1958,6 +2012,7 @@ def build_phy_frame(bits, mod: Modulator,
 # receiver/receive.py
 from __future__ import annotations
 from typing import Dict, List, Tuple
+import os
 import numpy as np
 
 from common.backend import to_xp
@@ -1970,15 +2025,28 @@ from data_link_layer.encoding import (
 from physical_layer.modulation import Modulator
 from channel.channel_model import equalize
 
+# tqdm はオプション（環境変数 RX_TQDM=1 の時だけ表示）
+_USE_TQDM = str(os.getenv("RX_TQDM", "0")).strip().lower() in {"1","true","yes","y","on"}
+if _USE_TQDM:
+    try:
+        from tqdm.auto import tqdm as _tqdm_rx
+    except Exception:
+        _USE_TQDM = False
+        _tqdm_rx = None
+else:
+    _tqdm_rx = None
+
 def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tuple[bytes, bytes, dict]:
     mod = Modulator(tx_meta["mod_scheme"])
     frames_bits: List[np.ndarray] = []
     frames_rel:  List[np.ndarray] = []
     est_channels: List[complex] = []
 
-    z = to_xp(rx_symbols)  # GPU/CPU どちらでも OK
+    z = to_xp(rx_symbols)
+    ranges = tx_meta["frame_symbol_ranges"]
+    bar = _tqdm_rx(total=len(ranges), desc="RX demod+FEC (frames)", unit="frm") if (_USE_TQDM and _tqdm_rx) else None
 
-    for i, (start, end) in enumerate(tx_meta["frame_symbol_ranges"]):
+    for i, (start, end) in enumerate(ranges):
         syms = z[start:end]
         pilot_len = len(tx_meta["pilots_tx"][i])
         preamble_len = cfg.pilot.preamble_len
@@ -1988,10 +2056,17 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
         eq_data, h_hat = equalize(rx_data, tx_meta["pilots_tx"][i], rx_pilot)
         est_channels.append(h_hat)
 
-        bits, rel = mod.demodulate_with_reliability(eq_data)  # ← LLR 近似
+        bits, rel = mod.demodulate_with_reliability(eq_data)
         frames_bits.append(bits.astype(np.uint8))
         frames_rel.append(rel.astype(np.float32))
 
+        if bar is not None:
+            bar.update(1)
+
+    if bar is not None:
+        bar.close()
+
+    # ★ ここを strong_header=... に統一
     if cfg.link.fec_scheme.lower() == "hamming74":
         raw_frame_bytes = reverse_fec_and_deinterleave_soft(
             frames_bits, frames_rel,
@@ -2028,6 +2103,7 @@ def recover_from_symbols(rx_symbols, tx_meta: Dict, cfg: SimulationConfig) -> Tu
 # transmitter/send.py
 from __future__ import annotations
 from typing import List, Tuple
+import os
 
 from common.backend import xp, to_xp
 from common.config import SimulationConfig
@@ -2035,39 +2111,71 @@ from common.byte_mapping import map_bytes
 from data_link_layer.encoding import segment_message, apply_fec_and_interleave
 from physical_layer.modulation import Modulator, build_phy_frame
 
+# 環境変数 TX_TQDM=1 でフレーム単位の進捗バーを表示（任意）
+_USE_TQDM = str(os.getenv("TX_TQDM", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
+if _USE_TQDM:
+    try:
+        from tqdm.auto import tqdm as _tqdm_tx
+    except Exception:
+        _USE_TQDM = False
+        _tqdm_tx = None
+else:
+    _tqdm_tx = None
+
 def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: SimulationConfig):
+    """
+    アプリ層ヘッダ＋ペイロードをリンク層セグメント化→FEC/インタリーブ→
+    物理層フレーム（preamble+pilot+data symbols）にし，連結して返す。
+    返り値:
+        tx_symbols: backend（NumPy/CuPy）complex128 1D
+        tx_meta   : 受信側の復調に必要なメタ情報
+    """
+    # 0) バイトマッピング（可逆）
     mapping_seed = cfg.link.byte_mapping_seed if cfg.link.byte_mapping_seed is not None else cfg.chan.seed
     mapped_payload = map_bytes(
-        payload_bytes, mtu_bytes=cfg.link.mtu_bytes,
-        scheme=cfg.link.byte_mapping_scheme, seed=mapping_seed
+        payload_bytes,
+        mtu_bytes=cfg.link.mtu_bytes,
+        scheme=cfg.link.byte_mapping_scheme,
+        seed=mapping_seed
     )
 
+    # 1) リンク層セグメンテーション（ヘッダ複製）
     frames = segment_message(
-        app_header_bytes, mapped_payload,
-        mtu_bytes=cfg.link.mtu_bytes, header_copies=cfg.link.header_copies
+        app_header_bytes,
+        mapped_payload,
+        mtu_bytes=cfg.link.mtu_bytes,
+        header_copies=cfg.link.header_copies
     )
 
+    # 2) FEC＋インタリーブ
+    # ★ 引数名を strong_header に修正（encoding.apply_fec_and_interleave 側の定義に合わせる）
     enc_bits_list, orig_bit_lengths = apply_fec_and_interleave(
-        frames, fec_scheme=cfg.link.fec_scheme, repeat_k=cfg.link.repeat_k,
+        frames,
+        fec_scheme=cfg.link.fec_scheme,
+        repeat_k=cfg.link.repeat_k,
         interleaver_depth=cfg.link.interleaver_depth,
         strong_header=cfg.link.strong_header_protection,
         header_copies=cfg.link.header_copies,
         header_rep_k=cfg.link.header_rep_k
     )
 
+    # 3) 物理層シンボル化
     mod = Modulator(cfg.mod.scheme)
-    frame_symbol_ranges: List[Tuple[int,int]] = []
+    frame_symbol_ranges: List[Tuple[int, int]] = []
     pilots_tx: List = []
     data_symbol_counts: List[int] = []
     all_syms: List = []
+
     cursor = 0
+    bar = _tqdm_tx(total=len(enc_bits_list), desc="TX build (frames)", unit="frm") if (_USE_TQDM and _tqdm_tx) else None
     for bits in enc_bits_list:
         syms, pilot, data_syms = build_phy_frame(
             bits, mod,
             preamble_len_bits=cfg.pilot.preamble_len,
             pilot_len_symbols=cfg.pilot.pilot_len
         )
-        # ここで backend に統一
+
+        # backend（NumPy/CuPy）に統一
         syms = to_xp(syms, dtype=xp.complex128)
         pilot = to_xp(pilot, dtype=xp.complex128)
         data_syms = to_xp(data_syms, dtype=xp.complex128)
@@ -2075,9 +2183,15 @@ def build_transmission(app_header_bytes: bytes, payload_bytes: bytes, cfg: Simul
         all_syms.append(syms)
         pilots_tx.append(pilot)
         data_symbol_counts.append(int(data_syms.size))
+
         L = int(syms.size)
         frame_symbol_ranges.append((cursor, cursor + L))
         cursor += L
+
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
 
     tx_symbols = xp.concatenate(all_syms) if all_syms else xp.zeros(0, dtype=xp.complex128)
     tx_meta = {
