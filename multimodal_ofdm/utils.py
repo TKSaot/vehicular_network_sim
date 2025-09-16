@@ -1,5 +1,3 @@
-
-# multimodal_ofdm/utils.py
 from __future__ import annotations
 import numpy as np
 import binascii

@@ -1,6 +1,4 @@
 
-# multimodal_ofdm/application.py
-
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional, Any, Tuple

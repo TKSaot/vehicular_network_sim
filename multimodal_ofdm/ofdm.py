@@ -1,5 +1,4 @@
 
-# multimodal_ofdm/ofdm.py
 from __future__ import annotations
 import numpy as np
 from typing import Dict, Tuple, List
