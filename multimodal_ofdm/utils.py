@@ -33,6 +33,44 @@ def verify_and_strip_crc32(data_with_crc: bytes) -> tuple[bool, bytes]:
     ok = (binascii.crc32(pl) & 0xFFFFFFFF) == int.from_bytes(crc_b, "big")
     return ok, pl
 
+# ----------------- Byte mapping (permute) -----------------
+def derive_modality_seed(base_seed: int, modality: str) -> int:
+    """
+    洗練しすぎない単純な派生: base_seed + 1009 * idx(modality)
+    安定再現性があり、他依存なし。
+    """
+    order = {"text": 0, "edge": 1, "depth": 2, "segmentation": 3}
+    idx = order.get(modality, 0)
+    return int((int(base_seed) + 1009 * idx) & 0xFFFFFFFF)
+
+def permute_bytes(data: bytes, seed: int) -> bytes:
+    """Deterministic permutation of a byte string using default_rng(seed)."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+    arr = np.frombuffer(data, dtype=np.uint8).copy()
+    n = arr.size
+    if n == 0:
+        return b""
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n)
+    arr = arr[perm]
+    return arr.tobytes()
+
+def unpermute_bytes(data: bytes, seed: int) -> bytes:
+    """Inverse of permute_bytes with the same seed and length."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+    arr = np.frombuffer(data, dtype=np.uint8).copy()
+    n = arr.size
+    if n == 0:
+        return b""
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n)
+    inv = np.empty_like(perm)
+    inv[perm] = np.arange(n, dtype=perm.dtype)
+    arr = arr[inv]
+    return arr.tobytes()
+
 # ----------------- Interleaving -----------------
 def block_interleave(bits: np.ndarray, depth: int) -> np.ndarray:
     """

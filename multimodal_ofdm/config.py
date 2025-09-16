@@ -21,6 +21,12 @@ class LinkConfig:
     header_rep_k: int = 5        # ヘッダ繰り返し
     header_boost_db: float = 6.0 # ヘッダのみ一定増幅（メタデータの保全用）
 
+    # ★ 追加: バイトマッピング
+    # none | permute（乱順）
+    byte_mapping: Literal["none", "permute"] = "permute"
+    # 乱順のシード（モダリティごとに派生させる）
+    byte_seed: int = 12345
+
 @dataclass
 class OfdmConfig:
     n_fft: int = 512

@@ -10,7 +10,8 @@ from .application import (
 )
 from .utils import (
     bytes_to_bits, bits_to_bytes, append_crc32,
-    verify_and_strip_crc32, block_deinterleave
+    verify_and_strip_crc32, block_deinterleave,
+    permute_bytes, unpermute_bytes, derive_modality_seed,   # ← 追加
 )
 from .ofdm import assemble_grid
 from .channel import rayleigh_ofdm, awgn_ofdm
@@ -61,7 +62,7 @@ def _majority_bits(bit_arrays: list[np.ndarray]) -> np.ndarray:
     s = np.sum(M, axis=0)
     return (s >= (M.shape[0]//2 + 1)).astype(np.uint8)
 
-# ---- robust saver（まとめ.py 流儀：明示モード） ----
+# ---- robust saver（明示モード） ----
 def _fix_img_shape(arr: np.ndarray, H: int, W: int, ch3: bool) -> np.ndarray:
     a = np.asarray(arr, dtype=np.uint8)
     if ch3:
@@ -131,12 +132,18 @@ def main():
     ap.add_argument("--examples-dir", type=str, default=None)
     ap.add_argument("--out-root", type=str, default=None)
     ap.add_argument("--tag", type=str, default="")
+    # ★ 追加: バイトマッピング指定
+    ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None,
+                    help="override LinkConfig.byte_mapping")
+    ap.add_argument("--byte-seed", type=int, default=None, help="override LinkConfig.byte_seed")
     args = ap.parse_args()
 
     cfg = ExperimentConfig()
     if args.snr_db is not None: cfg.chan.snr_db = float(args.snr_db)
     if args.channel is not None: cfg.chan.channel = args.channel
     if args.out_root is not None: cfg.paths.output_root = args.out_root
+    if args.byte_mapping is not None: cfg.link.byte_mapping = args.byte_mapping
+    if args.byte_seed is not None: cfg.link.byte_seed = int(args.byte_seed)
 
     examples_dir = _resolve_examples_dir(args.examples_dir)
     input_paths = {
@@ -151,6 +158,10 @@ def main():
     for m in MODS:
         hdr, pl = serialize_content(m, input_paths[m], app_cfg=None)
         hdrs[m] = hdr.to_bytes()
+        # ★ ここで permute（CRC は permuted bytes に対して計算）
+        if cfg.link.byte_mapping == "permute":
+            seed_m = derive_modality_seed(cfg.link.byte_seed, m)
+            pl = permute_bytes(pl, seed_m)
         payloads[m] = append_crc32(pl)
 
     # --- Power ---
@@ -239,7 +250,6 @@ def main():
             except Exception:
                 pass
         if rx_hdr is None:
-            # どちらかが parse できれば採用，無理なら TX ヘッダ
             for idx, hb in enumerate(hdr_bits_candidates):
                 try:
                     rx_hdr = AppHeader.from_bytes(bits_to_bytes(hb)); order_idx = idx; break
@@ -258,17 +268,24 @@ def main():
             return verify_and_strip_crc32(bb)
 
         first = (bC_pay if order_idx == 0 else bF_pay)
-        ok_crc, payload_clean = _decode_payload(first)
+        ok_crc, payload_perm = _decode_payload(first)
         if not ok_crc:
             other = (bF_pay if order_idx == 0 else bC_pay)
             ok2, payload2 = _decode_payload(other)
             if ok2:
-                ok_crc, payload_clean = ok2, payload2
+                ok_crc, payload_perm = ok2, payload2
                 order_idx = 1 - order_idx
 
-        # 事後 SNR を推定（このモダリティの全ペイロード列）
+        # 事後 SNR
         r_pay = pay_cols.real.reshape(-1)
         snr_by_mod[m] = _estimate_snr_db_from_real(r_pay)
+
+        # --- ★ ここで unpermute（CRCは permuted bytes 上で検証済み）
+        if cfg.link.byte_mapping == "permute":
+            seed_m = derive_modality_seed(cfg.link.byte_seed, m)
+            payload_clean = unpermute_bytes(payload_perm, seed_m)
+        else:
+            payload_clean = payload_perm
 
         # 画像／テキスト復元
         try:
@@ -300,12 +317,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     outputs = {}
-    # テキスト
     p_txt = os.path.join(out_dir, "text_received.txt")
     with open(p_txt, "w", encoding="utf-8") as f:
         f.write(results["text"]["text"])
     outputs["text"] = p_txt
-    # 画像
     p_edge = os.path.join(out_dir, "edge_received.png")
     p_depth = os.path.join(out_dir, "depth_received.png")
     p_seg  = os.path.join(out_dir, "segmentation_received.png")
@@ -314,7 +329,7 @@ def main():
     _save_png_uint8(p_seg,   results["segmentation"]["img"], modality="segmentation", rx_hdr=results["segmentation"]["rx_hdr"])
     outputs["edge"] = p_edge; outputs["depth"] = p_depth; outputs["segmentation"] = p_seg
 
-    # --- メトリクス（SSIM と CER 追加） ---
+    # --- メトリクス ---
     from .application import _load_image
     origs = {
         "edge": _load_image(input_paths["edge"], "L"),
@@ -323,19 +338,16 @@ def main():
     }
     ids_true, pal_true, _ = _build_seg_ids_and_palette(_suppress_white_boundaries(origs["segmentation"], 250, 2), 250)
 
-    # Edge
     e_gt = (origs["edge"] >= 128).astype(np.uint8) * 255
     e_rx = results["edge"]["img"].astype(np.uint8)
     edge_f1 = float(f1_binary_edge(e_gt, e_rx))
     edge_ssim = float(ssim(e_gt, e_rx, data_range=255))
 
-    # Depth
     d_gt = origs["depth"].astype(np.uint8)
     d_rx = results["depth"]["img"].astype(np.uint8)
     depth_psnr = float(psnr(d_gt, d_rx, data_range=255))
     depth_ssim = float(ssim(d_gt, d_rx, data_range=255))
 
-    # Segmentation
     rx_rgb = results["segmentation"]["img"].astype(np.int32)
     pal = pal_true.astype(np.int32)
     Hh, Ww, _ = rx_rgb.shape
@@ -344,7 +356,6 @@ def main():
     ids_pred = np.argmin(d2, axis=1).reshape(Hh, Ww).astype(np.int64)
     seg_miou = float(miou_from_ids(ids_true.astype(np.int64), ids_pred, K=int(pal_true.shape[0])))
 
-    # Text CER 近似
     with open(input_paths["text"], "r", encoding="utf-8") as f:
         orig_text = f.read()
     recv_text = results["text"]["text"]
@@ -352,12 +363,6 @@ def main():
     mism = sum(1 for i in range(minlen) if orig_text[i] != recv_text[i]) + abs(len(orig_text)-len(recv_text))
     text_cer = float(mism / max(1, len(orig_text)))
 
-    # 事後 SNR（全体）
-    all_real = []
-    for m in MODS:
-        if m == "text": continue
-        # pay_cols は上で閉じてしまっているので簡易に画像からは取れない．
-        # 代わりに per-mod の推定値の平均を “全体” として出す．
     snr_global = float(np.mean([snr_by_mod[k] for k in snr_by_mod.keys()]))
 
     metrics = {
@@ -378,6 +383,8 @@ def main():
         "mode": mode.upper(),
         "power_linear": weights,
         "power_preset": preset_name or "",
+        "byte_mapping": cfg.link.byte_mapping,
+        "byte_seed": cfg.link.byte_seed,
         "subcarrier_slices": {k: [v.start, v.stop] for k,v in sc_slices.items()},
         "inputs": input_paths,
         "outputs": outputs,
@@ -393,6 +400,7 @@ def main():
     print(f"Output dir: {out_dir}")
     print(f"SNR(dB): {cfg.chan.snr_db}  Channel: {cfg.chan.channel}")
     print(f"Mode: {mode.upper()}  Power: {weights}  Preset: {preset_name or '-'}")
+    print(f"Byte mapping: {cfg.link.byte_mapping} (seed={cfg.link.byte_seed})")
     print(f"CRC: " + ", ".join([f"{m}:{'OK' if results[m]['crc_ok'] else 'NG'}({results[m]['order']})" for m in MODS]))
     print(f"Edge F1: {edge_f1:.3f}  SSIM: {edge_ssim:.3f} | Depth PSNR: {depth_psnr:.2f} dB  SSIM: {depth_ssim:.3f} | Seg mIoU: {seg_miou:.3f}")
     print(f"Text CER≈{text_cer:.4f} | SNR(est): {snr_global:.2f} dB  {snr_by_mod}")
