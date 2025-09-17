@@ -17,12 +17,12 @@ class AppLayerConfig:
 
     # --- Edge (RX) ---
     # gentle keeps true thin lines; medium is a touch stronger; strong closes small gaps more aggressively
-    edge_denoise: Literal["none", "gentle", "medium", "strong"] = "gentle"
+    edge_denoise: Literal["none", "gentle", "medium", "strong"] = "none"
     edge_iters: int = 1
 
     # --- Depth (RX) ---
     # median3 (3x3) is robust to salt-and-pepper; median5 applies two 3x3 passes roughly equivalent to 5x5
-    depth_denoise: Literal["none", "median3", "median5"] = "median3"
+    depth_denoise: Literal["none", "median3", "median5"] = "none"
     depth_iters: int = 1
 
 @dataclass

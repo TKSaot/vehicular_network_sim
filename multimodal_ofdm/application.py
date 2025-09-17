@@ -163,31 +163,92 @@ def _majority3_ids(ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     frac = best_cnt / 9.0
     return mode_ids.astype(ids.dtype, copy=False), frac
 
+
+def _neighborhood_mode_ids(ids: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generalized (2r+1)x(2r+1) mode filter on integer IDs．
+    Returns (mode_ids， mode_count_fraction)．
+    Pure NumPy using shifted stacks．
+    """
+    S = _neighbors_stack2d(ids, radius=radius)  # (K,H,W)
+    # counts[i] = how many neighbors equal S[i] at each pixel
+    eq = (S[:, None, :, :] == S[None, :, :, :])  # (K,K,H,W) boolean
+    counts = eq.sum(axis=0)                       # (K,H,W)
+    best_idx = counts.argmax(axis=0)              # (H,W)
+    best_cnt = counts.max(axis=0).astype(np.float32)
+    mode_ids = np.take_along_axis(S, best_idx[None, :, :], axis=0)[0]
+    frac = best_cnt / float((2*radius + 1) * (2*radius + 1))
+    return mode_ids.astype(ids.dtype, copy=False), frac
+
+def _center_count_in_window(ids: np.ndarray, radius: int) -> np.ndarray:
+    """
+    For each pixel， count how many neighbors in the (2r+1)^2 window equal the center ID．
+    Used to detect tiny islands (center occurrences ≪ window size)．
+    """
+    S = _neighbors_stack2d(ids, radius=radius)   # (K,H,W)
+    eq_center = (S == ids[None, :, :])           # (K,H,W)
+    return eq_center.sum(axis=0).astype(np.int32)
+
+
+
+
 def _postprocess_seg_ids(ids: np.ndarray,
                          mode: str = "strong",
                          iters: int = 2,
                          tau: float = 0.6) -> np.ndarray:
     """
-    Boundary-aware interior majority. 3x3 mode with confidence >= tau on interior only.
-    `majority5` and `strong` widen the boundary belt (radius=2) and run more passes.
+    強化版セグメンテーション誤り補正（IDベース）．
+    - 近傍の多数決（mode filter）を境界帯域を避けて適用（3x3 → 5x5 の順）．
+    - 5x5 ウィンドウで“希少なラベル”（出現回数がごく少ない画素）を局所モードに置換してスパックル除去．
+    - これらを複数パス繰り返して安定化．
+    すべて ID（uint8/uint16）上で動作し，RGB には触れません．
     """
     if mode == "none" or ids.size == 0:
         return ids
-    belt_r = 1
+
+    # パラメータ設定（モードごとに強さを変える）
     passes = max(1, int(iters))
-    if mode in ("majority5", "strong"):
-        belt_r = 2
-        passes = max(passes, 2)
-        if mode == "strong":
-            tau = min(tau, 0.55)  # slightly easier to flip obvious interiors
+    if mode == "majority3":
+        belt_r = 1; r_list = [1]; tau_list = [float(tau)]
+        speckle = False
+    elif mode == "majority5":
+        belt_r = 2; r_list = [2]; tau_list = [min(0.65, float(tau))]
+        speckle = True
+    else:  # "strong"（既定）
+        belt_r = 2; r_list = [1, 2]; tau_list = [min(0.65, float(tau)), 0.55]
+        speckle = True
 
     out = ids.copy()
+
     for _ in range(passes):
-        B = _dilate_mask(_boundary_mask_ids(out), belt_r)
+        # 1) “境界帯域”を広げて内部のみを強めに補正
+        B = _dilate_mask(_boundary_mask_ids(out), belt_r)  # True=境界近傍
         interior = ~B
-        mode_ids, frac = _majority3_ids(out)
-        upd = interior & (frac >= float(tau)) & (mode_ids != out)
-        out = np.where(upd, mode_ids, out)
+
+        # マルチスケール多数決
+        for r, t in zip(r_list, tau_list):
+            mode_ids, frac = _neighborhood_mode_ids(out, radius=int(r))
+            upd = interior & (frac >= float(t)) & (mode_ids != out)
+            out = np.where(upd, mode_ids, out)
+
+        # 2) スパックル除去（ごく小さな“色の島”を吸収）
+        if speckle:
+            r = max(2, r_list[-1])
+            # 中心ラベルの出現回数（5x5 なら 25 中の回数）を数える
+            cnt_center = _center_count_in_window(out, radius=int(r))
+            # ごく少ない島を検出（<=2 は非常に保守的）
+            rare = cnt_center <= 2
+            if rare.any():
+                mode_ids_r, frac_r = _neighborhood_mode_ids(out, radius=int(r))
+                # 強いモード支配がある所だけ置換（安全サイド）
+                replace = rare & (frac_r >= 0.6) & (mode_ids_r != out)
+                out = np.where(replace, mode_ids_r, out)
+
+        # 3) 仕上げに 3x3 でもう一度だけ軽く整える
+        mode3, frac3 = _neighborhood_mode_ids(out, radius=1)
+        fin_upd = interior & (frac3 >= 0.6) & (mode3 != out)
+        out = np.where(fin_upd, mode3, out)
+
     return out
 
 def _denoise_edge_binary(edge: np.ndarray,
