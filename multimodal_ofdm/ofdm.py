@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, Tuple, List
 from .config import OfdmConfig
-from .utils import bytes_to_bits, bits_to_bytes, block_interleave, block_deinterleave
+from .utils import bytes_to_bits, bits_to_bytes, block_interleave, block_deinterleave, repeat_bits
 from . import hamming74 as ham
 
 def bpsk_mod(bits: np.ndarray) -> np.ndarray:
@@ -40,15 +40,20 @@ def assemble_grid(payload_per_mod: Dict[str, bytes],
     sc_slices = make_subcarrier_slices(cfg_ofdm, mods)
 
     # 1) Convert bytes -> bits -> Hamming -> interleave
-    def _enc(b: bytes) -> np.ndarray:
+    def _enc(b: bytes, rep_k: int) -> np.ndarray:
         bt = bytes_to_bits(b)
         enc = ham.encode(bt)
+        if int(rep_k) > 1:
+            enc = repeat_bits(enc, int(rep_k))
         inter = block_interleave(enc, cfg_link.interleaver_depth)
         return inter
 
     # Repeat & boost headers to be robust (constant across EEP/EEP)
-    hdr_bits = {m: np.tile(_enc(header_per_mod[m]), cfg_link.header_rep_k) for m in mods}
-    pay_bits = {m: _enc(payload_per_mod[m]) for m in mods}
+    hdr_bits = {m: np.tile(_enc(header_per_mod[m], 1), cfg_link.header_rep_k) for m in mods}
+    pay_bits = {}
+    for m in mods:
+        rep_k = getattr(cfg_link, 'payload_rep_k', {}).get(m, 1)
+        pay_bits[m] = _enc(payload_per_mod[m], rep_k)
 
     # 2) Map to BPSK with power scaling; first OFDM symbol is pilot=1+0j
     Nsc = cfg_ofdm.used_subcarriers

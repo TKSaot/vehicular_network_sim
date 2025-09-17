@@ -71,6 +71,36 @@ def unpermute_bytes(data: bytes, seed: int) -> bytes:
     arr = arr[inv]
     return arr.tobytes()
 
+
+# ----------------- Simple Repetition -----------------
+def repeat_bits(bits: np.ndarray, k: int) -> np.ndarray:
+    """Repeat each bit k times (k>=1). k==1 returns the input unchanged."""
+    k = int(max(1, k))
+    b = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    if k == 1 or b.size == 0:
+        return b
+    return np.repeat(b, k).astype(np.uint8, copy=False)
+
+def derepeat_bits_majority(bits: np.ndarray, k: int, original_len: int | None = None) -> np.ndarray:
+    """Inverse of repeat_bits with majority vote over groups of size k.
+    If 'original_len' is provided, output is trimmed to that length.
+    Ties (possible only when k is even) are resolved toward 0/1 by threshold ceil(k/2).
+    """
+    k = int(max(1, k))
+    b = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    if k == 1 or b.size == 0:
+        return b[:original_len] if original_len is not None else b
+    # pad to multiple of k
+    Lout = int(len(b) // k) if original_len is None else int(original_len)
+    need = Lout * k - len(b)
+    if need > 0:
+        b = np.concatenate([b, np.zeros(need, dtype=np.uint8)])
+    M = b.reshape(Lout, k)
+    thr = (k // 2) + 1  # strict majority
+    # count ones per row
+    s = M.sum(axis=1)
+    out = (s >= thr).astype(np.uint8)
+    return out[:original_len] if original_len is not None else out
 # ----------------- Interleaving -----------------
 def block_interleave(bits: np.ndarray, depth: int) -> np.ndarray:
     """

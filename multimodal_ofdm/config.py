@@ -29,9 +29,14 @@ class AppLayerConfig:
 class LinkConfig:
     # FEC: Hamming(7,4) + block interleaver (UEP/EEP does not change this)
     mtu_bytes: int = 256
-    interleaver_depth: int = 128
+    interleaver_depth: int = 256
     header_rep_k: int = 5
     header_boost_db: float = 6.0
+
+    # Payload repetition per modality (outer code before interleaver)
+    payload_rep_k: Dict[Modal, int] = field(default_factory=lambda: {
+        'text': 4, 'edge': 1, 'depth': 1, 'segmentation': 1
+    })
 
     # --- Byte mapping (payload only) ---
     byte_mapping: Literal["none", "permute"] = "permute"

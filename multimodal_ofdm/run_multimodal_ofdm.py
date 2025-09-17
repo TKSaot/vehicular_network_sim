@@ -11,6 +11,7 @@ from .application import (
 from .utils import (
     bytes_to_bits, bits_to_bytes, append_crc32,
     verify_and_strip_crc32, block_deinterleave,
+    derepeat_bits_majority,
     permute_bytes, unpermute_bytes, derive_modality_seed,
 )
 from .ofdm import assemble_grid
@@ -132,6 +133,7 @@ def main():
     ap.add_argument("--tag", type=str, default="")
     ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None)
     ap.add_argument("--byte-seed", type=int, default=None)
+    ap.add_argument("--payload-rep", type=str, default="", help="per-mod repetition, e.g. text=3,edge=1,depth=1,segmentation=1")
     args = ap.parse_args()
 
     cfg = ExperimentConfig()
@@ -140,6 +142,16 @@ def main():
     if args.out_root is not None: cfg.paths.output_root = args.out_root
     if args.byte_mapping is not None: cfg.link.byte_mapping = args.byte_mapping
     if args.byte_seed is not None: cfg.link.byte_seed = int(args.byte_seed)
+    if args.payload_rep:
+        _rep = _parse_power_arg(args.payload_rep)
+        cur = getattr(cfg.link, 'payload_rep_k', {}).copy()
+        for k,v in _rep.items():
+            try:
+                cur[k] = int(round(float(v)))
+            except Exception:
+                pass
+        cfg.link.payload_rep_k = cur
+
 
     examples_dir = _resolve_examples_dir(args.examples_dir)
     input_paths = {
@@ -210,13 +222,16 @@ def main():
         L_pay0 = len(bytes_to_bits(payloads[m]))
         D = cfg.link.interleaver_depth; Krep = cfg.link.header_rep_k
 
+        rep_k = int(getattr(cfg.link, 'payload_rep_k', {}).get(m, 1))
+
         L_hdr1 = _ham_encoded_len(L_hdr0)
         L_hdr2 = _after_interleave_len(L_hdr1, D)
         L_hdr3 = Krep * L_hdr2
         n_hdr_cols = int(np.ceil(L_hdr3 / per))
 
         L_pay1 = _ham_encoded_len(L_pay0)
-        L_pay2 = _after_interleave_len(L_pay1, D)
+        L_pay1r = rep_k * L_pay1
+        L_pay2 = _after_interleave_len(L_pay1r, D)
         n_pay_cols = int(np.ceil(L_pay2 / per))
 
         hdr_cols = Yeq[sl, 1:1+n_hdr_cols]
@@ -257,8 +272,12 @@ def main():
         bC_pay, bF_pay = _flatten_bits_from_cols(pay_cols, L_pay2)
         from . import hamming74 as ham
         def _decode_payload(bits_in: np.ndarray) -> tuple[bool, bytes]:
-            deinter = block_deinterleave(bits_in, D, original_len=L_pay1)
-            dec = ham.decode(deinter)[:L_pay0]
+            deinter = block_deinterleave(bits_in, D, original_len=L_pay1r)
+            if rep_k > 1:
+                derep = derepeat_bits_majority(deinter, rep_k, original_len=L_pay1)
+            else:
+                derep = deinter
+            dec = ham.decode(derep)[:L_pay0]
             bb = bits_to_bytes(dec)
             return verify_and_strip_crc32(bb)
 
@@ -386,6 +405,7 @@ def main():
         "power_preset": preset_name or "",
         "byte_mapping": cfg.link.byte_mapping,
         "byte_seed": cfg.link.byte_seed,
+        "payload_rep_k": getattr(cfg.link, "payload_rep_k", {}),
         "subcarrier_slices": {k: [v.start, v.stop] for k,v in sc_slices.items()},
         "inputs": input_paths,
         "outputs": outputs,
