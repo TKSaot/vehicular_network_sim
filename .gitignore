@@ -19,6 +19,10 @@ data/
 models/
 checkpoints/
 outputs
+eval
+plots_all
+out
+plots_psnr_ssim_lpips
 
 # OS
 .DS_Store

@@ -10,7 +10,7 @@ class AppLayerConfig:
     # pre-clean for white-like boundaries (TX also reads this when available)
     seg_white_thresh: int = 250
     # receiver-side denoise strength
-    seg_mode: Literal["none", "majority3", "majority5", "strong"] = "strong"
+    seg_mode: Literal["none", "majority3", "majority5", "strong"] = "none"
     seg_iters: int = 2
     seg_consensus_min_frac: float = 0.6  # majority confidence threshold
     seg_seed: int = 123
