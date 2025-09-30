@@ -7,35 +7,32 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 @dataclass
 class AppLayerConfig:
     # --- Segmentation (RX) ---
-    # pre-clean for white-like boundaries (TX also reads this when available)
     seg_white_thresh: int = 250
-    # receiver-side denoise strength
     seg_mode: Literal["none", "majority3", "majority5", "strong"] = "none"
     seg_iters: int = 2
     seg_consensus_min_frac: float = 0.6  # majority confidence threshold
     seg_seed: int = 123
 
     # --- Edge (RX) ---
-    # gentle keeps true thin lines; medium is a touch stronger; strong closes small gaps more aggressively
     edge_denoise: Literal["none", "gentle", "medium", "strong"] = "none"
     edge_iters: int = 1
 
     # --- Depth (RX) ---
-    # median3 (3x3) is robust to salt-and-pepper; median5 applies two 3x3 passes roughly equivalent to 5x5
     depth_denoise: Literal["none", "median3", "median5"] = "none"
     depth_iters: int = 1
 
 @dataclass
 class LinkConfig:
-    # FEC: Hamming(7,4) + block interleaver (UEP/EEP does not change this)
+    # FEC: Hamming(7,4) + block interleaver
     mtu_bytes: int = 256
     interleaver_depth: int = 256
     header_rep_k: int = 5
     header_boost_db: float = 6.0
 
-    # Payload repetition per modality (outer code before interleaver)
+    # Payload repetition per modality (outer code before interleaver).
+    # FAIR BASELINE: set all to 1 (no repetition) so power-allocation studies are not confounded.
     payload_rep_k: Dict[Modal, int] = field(default_factory=lambda: {
-        'text': 4, 'edge': 1, 'depth': 1, 'segmentation': 1
+        'text': 1, 'edge': 1, 'depth': 1, 'segmentation': 1
     })
 
     # --- Byte mapping (payload only) ---
