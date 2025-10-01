@@ -6,6 +6,14 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 
 @dataclass
 class AppLayerConfig:
+    # --- Text (TX/RX) ---
+    # Alphabet used by the robust text codec (order matters; include space if you want it preserved)
+    text_symbols = "abcdefghijklmnopqrstuvwxyz1234567890, .\n"
+    # Bits per character for the robust text codec (8 now; 9 later if you expand the alphabet or want SEC capability)
+    text_bits_per_char: int = 8
+    # Convert input text to lowercase before encoding (recommended for compact alphabets)
+    text_casefold: bool = True
+
     # --- Segmentation (RX) ---
     seg_white_thresh: int = 250
     seg_mode: Literal["none", "majority3", "majority5", "strong"] = "none"

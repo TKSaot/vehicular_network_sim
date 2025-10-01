@@ -4,6 +4,178 @@ from typing import Literal, Optional, Any, Tuple
 import numpy as np
 from PIL import Image
 
+
+# ---------- Robust Text Codec (symbol-level, nearest-neighbor over fixed-length codes) ----------
+# We map characters from a controlled alphabet to B-bit codewords (B=8 by default).
+# On RX we decode each B-bit symbol to the nearest valid codeword in Hamming distance.
+# This avoids UTF-8 replacement characters and keeps substitutions within the symbol set.
+from functools import lru_cache
+
+def _popcount_table(n_bits: int = 9):
+    # Build a popcount lookup up to 2^n_bits (9 bits supports both 8- and 9-bit symbols).
+    maxv = 1 << int(max(1, n_bits))
+    return [bin(i).count("1") for i in range(maxv)]
+
+# Precompute popcounts for speed (0..511)
+_POPCNT_9 = _popcount_table(9)
+
+def _hamdist(a: int, b: int) -> int:
+    return _POPcnt9[a ^ b]
+
+# Typo-proof alias (used below)
+_POPcnt9 = _POPCNT_9
+
+def _sanitize_text_for_codec(s: str, symbols: str, casefold: bool = True) -> str:
+    t = s.lower() if casefold else s
+    # map newlines/tabs to spaces; collapse carriage-returns
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.replace("\n", " ").replace("\t", " ")
+    # keep only allowed symbols; unknown -> space (ensure space is in symbols)
+    if " " not in symbols:
+        symbols = symbols + " "
+    allowed = set(symbols)
+    out_chars = []
+    for ch in t:
+        out_chars.append(ch if ch in allowed else " ")
+    return "".join(out_chars)
+
+@lru_cache(maxsize=64)
+def _build_text_codebook(symbols: str, bits: int) -> tuple[dict, list, list]:
+    """
+    Returns (enc_map, chosen_codes, lut_idx), where:
+      - enc_map: dict char -> code (0..2^bits-1)
+      - chosen_codes: list[int] of codewords in the same order as 'symbols'
+      - lut_idx: list[int] of length 2^bits mapping any value -> index into 'symbols' (nearest neighbor, ties -> lowest index)
+    Greedy farthest-point selection to maximize separation.
+    Deterministic given (symbols, bits).
+    """
+    bits = int(bits)
+    assert bits in (8, 9), "Only 8 or 9 bits per symbol are supported in this codec."
+    Q = 1 << bits
+    # Greedy farthest-point: pick codes to maximize min distance to already chosen, break ties by larger sum distance then lower code.
+    chosen = []
+    # start from 0x00 to keep space nicely centered if present
+    chosen.append(0)
+    # accelerate evaluation with vectorized popcounts
+    import numpy as _np
+    pop = _np.frombuffer(_np.array(_POPCNT_9[:Q], dtype=_np.uint8).data, dtype=_np.uint8)
+    for _ in range(1, len(symbols)):
+        # compute score for all candidates not yet chosen
+        mask = _np.ones(Q, dtype=bool)
+        mask[chosen] = False
+        cand = _np.nonzero(mask)[0]
+        if len(cand) == 0:
+            break
+        # distances to each chosen codeword
+        dmin = _np.full(cand.shape, 99, dtype=_np.int16)
+        dsum = _np.zeros(cand.shape, dtype=_np.int32)
+        for c in chosen:
+            x = cand ^ c
+            pc = pop[x]
+            dmin = _np.minimum(dmin, pc.astype(_np.int16))
+            dsum += pc.astype(_np.int32)
+        # choose candidate(s) maximizing (dmin, dsum, -code) lexicographically
+        # first select by dmin
+        best_dmin = int(dmin.max())
+        i_best = _np.nonzero(dmin == best_dmin)[0]
+        if i_best.size > 1:
+            # then by dsum
+            best_dsum = int(dsum[i_best].max())
+            i_best = i_best[dsum[i_best] == best_dsum]
+        # finally choose the smallest numeric code for determinism
+        best_code = int(cand[i_best].min())
+        chosen.append(best_code)
+
+    # Build encoder map (char -> code)
+    enc_map = {symbols[i]: int(chosen[i]) for i in range(len(symbols))}
+
+    # Build LUT: nearest-neighbor index into 'symbols' for every possible value
+    lut_idx = [0] * Q
+    for v in range(Q):
+        # distances to chosen
+        dists = [ _POPCNT_9[v ^ c] for c in chosen[:len(symbols)] ]
+        m = min(dists)
+        # choose lowest-index symbol on ties
+        best_i = dists.index(m)
+        lut_idx[v] = best_i
+
+    return enc_map, list(chosen[:len(symbols)]), lut_idx
+
+def _pack_symbols_to_bytes(vals: list[int], bits: int) -> bytes:
+    """Pack a list of integer symbols (each 'bits' wide) into a byte string."""
+    bits = int(bits)
+    if bits == 8:
+        import numpy as _np
+        if not vals:
+            return b""
+        return _np.asarray(vals, dtype=_np.uint8).tobytes()
+    # generic pack
+    out = bytearray()
+    acc = 0
+    acc_bits = 0
+    mask = (1 << bits) - 1
+    for v in vals:
+        acc = ((acc << bits) | (int(v) & mask)) & ((1 << (acc_bits + bits + 8)) - 1)
+        acc_bits += bits
+        while acc_bits >= 8:
+            shift = acc_bits - 8
+            out.append((acc >> shift) & 0xFF)
+            acc &= (1 << shift) - 1
+            acc_bits -= 8
+    if acc_bits > 0:
+        out.append((acc << (8 - acc_bits)) & 0xFF)
+    return bytes(out)
+
+def _unpack_symbols_from_bytes(data: bytes, bits: int) -> list[int]:
+    """Inverse of _pack_symbols_to_bytes; returns list of symbol integers."""
+    bits = int(bits)
+    if bits == 8:
+        return list(data)
+    vals = []
+    acc = 0
+    acc_bits = 0
+    mask = (1 << bits) - 1
+    for b in data:
+        acc = ((acc << 8) | int(b)) & ((1 << (acc_bits + 8 + bits)) - 1)
+        acc_bits += 8
+        while acc_bits >= bits:
+            shift = acc_bits - bits
+            v = (acc >> shift) & mask
+            vals.append(int(v))
+            acc &= (1 << shift) - 1
+            acc_bits -= bits
+    return vals
+
+def _encode_text_payload(raw_text: str, app_cfg: Optional[Any] = None) -> tuple[bytes, int, str]:
+    """
+    Convert raw text to encoded payload bytes using the configured alphabet and bits per char.
+    Returns (payload_bytes, bits_per_char, symbols_string).
+    """
+    # Defaults
+    symbols = getattr(app_cfg, "text_symbols", "abcdefghijklmnopqrstuvwxyz123456789, .") if app_cfg is not None else "abcdefghijklmnopqrstuvwxyz123456789, ."
+    bits = int(getattr(app_cfg, "text_bits_per_char", 8) if app_cfg is not None else 8)
+    casefold = bool(getattr(app_cfg, "text_casefold", True) if app_cfg is not None else True)
+
+    clean = _sanitize_text_for_codec(raw_text, symbols=symbols, casefold=casefold)
+
+    enc_map, _, _ = _build_text_codebook(symbols, bits)
+    vals = [enc_map[ch] for ch in clean] if clean else []
+    payload = _pack_symbols_to_bytes(vals, bits)
+    return payload, bits, symbols
+
+def _decode_text_payload(payload_bytes: bytes, bits: int, symbols: str) -> str:
+    """Inverse of _encode_text_payload. Always emits characters from 'symbols' only."""
+    _, __, lut_idx = _build_text_codebook(symbols, bits)
+    vals = _unpack_symbols_from_bytes(payload_bytes, bits)
+    # Nearest-neighbor decode: map any value to a symbol index
+    out_chars = []
+    for v in vals:
+        idx = lut_idx[int(v)]
+        out_chars.append(symbols[idx])
+    return "".join(out_chars)
+
+
+
 # ---- App header ----
 @dataclass
 class AppHeader:
@@ -296,9 +468,11 @@ def _median_filter_uint8(img: np.ndarray, radius: int = 1, passes: int = 1) -> n
 # ---- Serialize/deserialize ----
 def serialize_content(modality: str, path: str, app_cfg: Optional[Any] = None) -> tuple[AppHeader, bytes]:
     if modality == "text":
-        data = load_text_as_bytes(path)
-        hdr = AppHeader(version=1, modality="text", payload_len_bytes=len(data))
-        return hdr, data
+        # Load, sanitize to the configured alphabet, and encode with robust B-bit symbols.
+        raw = load_text_as_bytes(path).decode('utf-8', errors='ignore')
+        payload, bits, symbols = _encode_text_payload(raw, app_cfg)
+        hdr = AppHeader(version=1, modality="text", bits_per_sample=bits, payload_len_bytes=len(payload))
+        return hdr, payload
 
     if modality == "edge":
         arr = _load_image(path, "L")
@@ -332,7 +506,6 @@ def serialize_content(modality: str, path: str, app_cfg: Optional[Any] = None) -
         hdr = AppHeader(version=1, modality="segmentation", height=h, width=w, channels=1,
                         bits_per_sample=bits, payload_len_bytes=len(id_bytes))
         return hdr, id_bytes
-
     raise ValueError("Unknown modality")
 
 def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int,...], dtype) -> np.ndarray:
@@ -349,10 +522,14 @@ def _reshape_bytes_safe(payload_bytes: bytes, shape: tuple[int,...], dtype) -> n
 
 def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[Any] = None) -> tuple[str, np.ndarray]:
     if hdr.modality == "text":
+        # Decode using the nearest-neighbor symbol codec (no UTF-8 replacement).
+        bits = int(hdr.bits_per_sample) if getattr(hdr, 'bits_per_sample', 0) else int(getattr(app_cfg, 'text_bits_per_char', 8) if app_cfg is not None else 8)
+        symbols = getattr(app_cfg, 'text_symbols', 'abcdefghijklmnopqrstuvwxyz123456789, .') if app_cfg is not None else 'abcdefghijklmnopqrstuvwxyz123456789, .'
         try:
-            s = payload_bytes.decode("utf-8", errors="replace")
+            s = _decode_text_payload(payload_bytes, bits=bits, symbols=symbols)
         except Exception:
-            s = ""
+            # Safety fallback: treat as 8-bit symbols with default alphabet
+            s = _decode_text_payload(payload_bytes, bits=8, symbols='abcdefghijklmnopqrstuvwxyz123456789, .')
         return s, np.array([], dtype=np.uint8)
 
     if hdr.modality == "edge":
@@ -397,5 +574,4 @@ def deserialize_content(hdr: AppHeader, payload_bytes: bytes, app_cfg: Optional[
         ids = np.minimum(ids, (K-1))
         rgb = pal[ids]
         return "", rgb.astype(np.uint8)
-
     raise ValueError("Unknown modality")
