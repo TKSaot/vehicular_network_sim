@@ -4,36 +4,56 @@ from typing import Dict, Literal
 
 Modal = Literal["text", "edge", "depth", "segmentation"]
 
+# MODIFIED: LlmConfig now directly controls the feature
+@dataclass
+class LlmConfig:
+    # --- Gemini API Settings ---
+    # To enable text correction, change this to True
+    correction_enabled: bool = False
+    
+    # IMPORTANT: Replace "YOUR_GEMINI_API_KEY" with your actual Gemini API key
+    api_key: str = "AIzaSyD6TkWGsxTH2NMNxvQ2HEsXZhE5IUKtaR8"
+    # The model to use for correction
+    model_name: str = "gemini-1.5-flash-latest"
+
+
 @dataclass
 class AppLayerConfig:
-    # ... (変更なし)
+    # --- Text (TX/RX) ---
     text_symbols = "abcdefghijklmnopqrstuvwxyz1234567890, .\n"
     text_bits_per_char: int = 8
     text_casefold: bool = True
+
+    # --- Segmentation (RX) ---
     seg_white_thresh: int = 250
     seg_mode: Literal["none", "majority3", "majority5", "strong"] = "none"
     seg_iters: int = 2
     seg_consensus_min_frac: float = 0.6
     seg_seed: int = 123
+
+    # --- Edge (RX) ---
     edge_denoise: Literal["none", "gentle", "medium", "strong"] = "none"
     edge_iters: int = 1
+
+    # --- Depth (RX) ---
     depth_denoise: Literal["none", "median3", "median5"] = "none"
     depth_iters: int = 1
 
 @dataclass
 class LinkConfig:
-    # ... (decoder_type, etc.)
+    # --- FEC / Decoder ---
     fec_enabled: bool = True
     decoder_type: Literal["hard", "soft"] = "hard"
     mtu_bytes: int = 256
     interleaver_depth: int = 256
     header_rep_k: int = 5
-    # MODIFIED: Removed header_boost_db as it is no longer used
-    # header_boost_db: float = 6.0
 
+    # --- Payload Repetition ---
     payload_rep_k: Dict[Modal, int] = field(default_factory=lambda: {
         'text': 1, 'edge': 1, 'depth': 1, 'segmentation': 1
     })
+
+    # --- Byte Mapping ---
     byte_mapping: Literal["none", "permute"] = "permute"
     byte_seed: int = 12345
 
@@ -69,6 +89,7 @@ class Paths:
 
 @dataclass
 class ExperimentConfig:
+    llm: LlmConfig = field(default_factory=LlmConfig)
     app: AppLayerConfig = field(default_factory=AppLayerConfig)
     link: LinkConfig = field(default_factory=LinkConfig)
     ofdm: OfdmConfig = field(default_factory=OfdmConfig)
