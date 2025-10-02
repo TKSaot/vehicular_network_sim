@@ -222,6 +222,8 @@ def main():
     ap.add_argument("--seg-mode", type=str, choices=["none","majority3","majority5","strong"], default=None)
     ap.add_argument("--metrics", type=str, default="all", help="Comma list among: all|none|edge|depth|seg|text")
     ap.add_argument("--metrics-if-crc", action="store_true", help="Only compute metric if its CRC passed")
+    # MODIFIED: Add a command-line argument for the channel seed
+    ap.add_argument("--seed", type=int, default=None, help="Seed for the channel random number generator")
     args = ap.parse_args()
 
     cfg = ExperimentConfig()
@@ -237,6 +239,9 @@ def main():
         cur = getattr(cfg.link, 'payload_rep_k', {}).copy()
         cur.update(_parse_kv_ints(args.payload_rep))
         cfg.link.payload_rep_k = cur
+    # MODIFIED: Set the channel seed if provided via the command line
+    if args.seed is not None:
+        cfg.chan.seed = args.seed
 
     if args.ecc_profile == "none":
         cfg.app.edge_denoise = "none"
@@ -318,15 +323,17 @@ def main():
         denom = np.where(np.abs(pilot_tx) < 1e-12, 1.0+0j, pilot_tx)
         Hhat = Y[:, 0] / denom
         eps = 1e-3
-        Hhat = np.where(np.abs(Hhat) < eps, 1.0+0j, Hhat)
-        Yeq = (Y / Hhat[:, None])
+        Hhat_reg = np.where(np.abs(Hhat) < eps, eps, Hhat) # Regularize to avoid division by zero
+        Yeq = (Y / Hhat_reg[:, None])
 
-    # ALL SUBSEQUENT CODE IS NOW CORRECTLY INDENTED TO BE PART OF main()
     # --- decode per modality ---
     results = {}
     snr_by_mod = {}
     for m in MODS:
-        sl = sc_slices[m]; per = sl.stop - sl.start
+        sl = sc_slices.get(m)
+        if sl is None: continue
+        per = sl.stop - sl.start
+        
         L_hdr0 = len(bytes_to_bits(hdrs[m]))
         L_pay0 = len(bytes_to_bits(payloads[m]))
         D = cfg.link.interleaver_depth; Krep = cfg.link.header_rep_k
@@ -335,12 +342,12 @@ def main():
         L_hdr1 = _encoded_len(L_hdr0, cfg.link.fec_enabled)
         L_hdr2 = _after_interleave_len(L_hdr1, D)
         L_hdr3 = Krep * L_hdr2
-        n_hdr_cols = int(math.ceil(L_hdr3 / per))
+        n_hdr_cols = int(math.ceil(L_hdr3 / per)) if per > 0 else 0
 
         L_pay1 = _encoded_len(L_pay0, cfg.link.fec_enabled)
         L_pay1r = rep_k * L_pay1
         L_pay2 = _after_interleave_len(L_pay1r, D)
-        n_pay_cols = int(math.ceil(L_pay2 / per))
+        n_pay_cols = int(math.ceil(L_pay2 / per)) if per > 0 else 0
 
         hdr_cols = Yeq[sl, 1:1+n_hdr_cols]
 
@@ -400,7 +407,6 @@ def main():
 
         pay_cols = Yeq[sl, 1+n_hdr_cols : 1+n_hdr_cols+n_pay_cols]
         
-        # Initialize payload2 for later fallback logic
         payload2 = b''
         
         if cfg.link.decoder_type == 'soft' and cfg.link.fec_enabled:
@@ -512,12 +518,13 @@ def main():
     outputs = {}
     p_txt = os.path.join(out_dir, "text_received.txt")
     with open(p_txt, "w", encoding="utf-8") as f:
-        f.write(results["text"]["text"])
+        f.write(results.get("text", {}).get("text", ""))
     outputs["text"] = p_txt
 
     def _should_save(mod: str) -> bool:
         policy = args.save_policy
         if policy == 'all': return True
+        if mod not in results: return False
         if policy == 'crc_only': return bool(results[mod]['crc_ok'])
         if policy == 'nonzero_only': return mod not in ZERO_MODS
         if policy == 'crc_and_nonzero_only': return (mod not in ZERO_MODS) and bool(results[mod]['crc_ok'])
@@ -529,19 +536,19 @@ def main():
     saved = []
     if _should_save("edge"):
         a = _fix_img_shape(results["edge"]["img"], results["edge"]["rx_hdr"].height, results["edge"]["rx_hdr"].width, ch3=False)
-        Image.frombytes("L", (a.shape[1], a.shape[0]), np.ascontiguousarray(a).tobytes()).copy().save(p_edge, format="PNG")
+        Image.fromarray(a).save(p_edge, format="PNG")
         outputs["edge"] = p_edge; saved.append("edge")
     else:
         outputs["edge"] = None
     if _should_save("depth"):
         a = _fix_img_shape(results["depth"]["img"], results["depth"]["rx_hdr"].height, results["depth"]["rx_hdr"].width, ch3=False)
-        Image.frombytes("L", (a.shape[1], a.shape[0]), np.ascontiguousarray(a).tobytes()).copy().save(p_depth, format="PNG")
+        Image.fromarray(a).save(p_depth, format="PNG")
         outputs["depth"] = p_depth; saved.append("depth")
     else:
         outputs["depth"] = None
     if _should_save("segmentation"):
         a = _fix_img_shape(results["segmentation"]["img"], results["segmentation"]["rx_hdr"].height, results["segmentation"]["rx_hdr"].width, ch3=True)
-        Image.frombytes("RGB", (a.shape[1], a.shape[0]), np.ascontiguousarray(a).tobytes()).copy().save(p_seg, format="PNG")
+        Image.fromarray(a).save(p_seg, format="PNG")
         outputs["segmentation"] = p_seg; saved.append("segmentation")
     else:
         outputs["segmentation"] = None
@@ -555,7 +562,7 @@ def main():
     metric_errors = {}
 
     try:
-        if ("edge" in metric_flags) and (not args.metrics_if_crc or results["edge"]["crc_ok"]):
+        if ("edge" in metric_flags) and results.get("edge") and (not args.metrics_if_crc or results["edge"]["crc_ok"]):
             e_gt = (_load_image(input_paths["edge"], "L") >= 128).astype(np.uint8) * 255
             e_rx = _fix_img_shape(results["edge"]["img"], results["edge"]["rx_hdr"].height, results["edge"]["rx_hdr"].width, ch3=False)
             metrics["edge_f1"] = float(f1_binary_edge(e_gt, e_rx))
@@ -566,7 +573,7 @@ def main():
         metric_errors["edge"] = str(ex); metrics["edge_f1"] = None; metrics["edge_ssim"] = None
 
     try:
-        if ("depth" in metric_flags) and (not args.metrics_if_crc or results["depth"]["crc_ok"]):
+        if ("depth" in metric_flags) and results.get("depth") and (not args.metrics_if_crc or results["depth"]["crc_ok"]):
             d_gt = _load_image(input_paths["depth"], "L").astype(np.uint8)
             d_rx = _fix_img_shape(results["depth"]["img"], results["depth"]["rx_hdr"].height, results["depth"]["rx_hdr"].width, ch3=False)
             metrics["depth_psnr"] = float(psnr(d_gt, d_rx, data_range=255))
@@ -577,7 +584,7 @@ def main():
         metric_errors["depth"] = str(ex); metrics["depth_psnr"] = None; metrics["depth_ssim"] = None
 
     try:
-        if ("seg" in metric_flags) and (not args.metrics_if_crc or results["segmentation"]["crc_ok"]):
+        if ("seg" in metric_flags) and results.get("segmentation") and (not args.metrics_if_crc or results["segmentation"]["crc_ok"]):
             seg_rgb_true = _suppress_white_boundaries(_load_image(input_paths["segmentation"], "RGB"),
                                                       getattr(cfg.app, "seg_white_thresh", 250),
                                                       getattr(cfg.app, "seg_iters", 2))
@@ -598,7 +605,7 @@ def main():
         metric_errors["seg"] = str(ex); metrics["seg_mIoU"] = None
 
     try:
-        if ("text" in metric_flags) and (not args.metrics_if_crc or results["text"]["crc_ok"]):
+        if ("text" in metric_flags) and results.get("text") and (not args.metrics_if_crc or results["text"]["crc_ok"]):
             with open(input_paths["text"], "r", encoding="utf-8") as f:
                 orig_text = f.read()
             recv_text = results["text"]["text"]
@@ -631,8 +638,8 @@ def main():
         "metrics": metrics,
         "metrics_config": {"selected": sorted(list(metric_flags)), "only_if_crc": bool(args.metrics_if_crc)},
         "metrics_errors": metric_errors,
-        "crc_by_modality": {m: results[m]["crc_ok"] for m in MODS},
-        "bit_order_by_modality": {m: results[m]["order"] for m in MODS},
+        "crc_by_modality": {m: results.get(m, {}).get("crc_ok") for m in MODS},
+        "bit_order_by_modality": {m: results.get(m, {}).get("order") for m in MODS},
         "rx_ecc_modes": {
             "edge_denoise": cfg.app.edge_denoise,
             "depth_denoise": cfg.app.depth_denoise,
@@ -648,29 +655,26 @@ def main():
 
     print("=== Multimodal OFDM Report ===")
     print(f"Output dir: {out_dir}")
-    print(f"SNR(dB): {cfg.chan.snr_db}  Channel: {cfg.chan.channel}")
+    print(f"SNR(dB): {cfg.chan.snr_db}  Channel: {cfg.chan.channel} (seed={cfg.chan.seed})")
     print(f"FEC: {'Enabled' if cfg.link.fec_enabled else 'Disabled'} (Decoder: {cfg.link.decoder_type})")
     print(f"Mode: {mode.upper()}  Power: {weights}  Preset: {preset_name or '-'}")
     print(f"Byte mapping: {cfg.link.byte_mapping} (seed={cfg.link.byte_seed})")
     print(f"Payload repetition k: {getattr(cfg.link, 'payload_rep_k', {})}")
     print(f"RX ECC: edge={cfg.app.edge_denoise}  depth={cfg.app.depth_denoise}  seg={cfg.app.seg_mode}")
-    print("CRC: " + ", ".join([f"{m}:{'OK' if results[m]['crc_ok'] else 'NG'}({results[m]['order']})" for m in MODS]))
-    if metrics.get("edge_f1") is not None:
-        print(f"Edge F1: {metrics['edge_f1']:.3f}  SSIM: {metrics.get('edge_ssim', float('nan')):.3f}", end=" | ")
-    else:
-        print("Edge F1: N/A  SSIM: N/A", end=" | ")
-    if metrics.get("depth_psnr") is not None:
-        print(f"Depth PSNR: {metrics['depth_psnr']:.2f} dB  SSIM: {metrics.get('depth_ssim', float('nan')):.3f}", end=" | ")
-    else:
-        print("Depth PSNR: N/A  SSIM: N/A", end=" | ")
-    if metrics.get("seg_mIoU") is not None:
-        print(f"Seg mIoU: {metrics['seg_mIoU']:.3f}")
-    else:
-        print("Seg mIoU: N/A")
-    if metrics.get("text_cer") is not None:
-        print(f"Text CER≈{metrics['text_cer']:.4f}", end=" | ")
-    else:
-        print("Text CER: N/A", end=" | ")
+    print("CRC: " + ", ".join([f"{m}:{'OK' if results.get(m, {}).get('crc_ok') else 'NG'}({results.get(m, {}).get('order', '-')})" for m in MODS]))
+    
+    if metrics.get("edge_f1") is not None: print(f"Edge F1: {metrics['edge_f1']:.3f}  SSIM: {metrics.get('edge_ssim', float('nan')):.3f}", end=" | ")
+    else: print("Edge F1: N/A", end=" | ")
+    
+    if metrics.get("depth_psnr") is not None: print(f"Depth PSNR: {metrics['depth_psnr']:.2f} dB  SSIM: {metrics.get('depth_ssim', float('nan')):.3f}", end=" | ")
+    else: print("Depth PSNR: N/A", end=" | ")
+
+    if metrics.get("seg_mIoU") is not None: print(f"Seg mIoU: {metrics['seg_mIoU']:.3f}")
+    else: print("Seg mIoU: N/A")
+
+    if metrics.get("text_cer") is not None: print(f"Text CER≈{metrics['text_cer']:.4f}", end=" | ")
+    else: print("Text CER: N/A", end=" | ")
+
     print(f"SNR(est): {snr_global:.2f} dB  {snr_by_mod}")
     print(f"Files: {outputs}")
     if metric_errors:
