@@ -260,11 +260,20 @@ def main():
                       n_fft=cfg.ofdm.n_fft, cp_len=cfg.ofdm.cp_len)
         H = np.ones(X.shape[0], dtype=np.complex128)
 
-    pilot_tx = X[:, 0]
-    denom = np.where(np.abs(pilot_tx) < 1e-12, 1.0+0j, pilot_tx)
-    Hhat = Y[:, 0] / denom
-    Hhat = np.where(np.abs(Hhat) < 1e-12, 1.0+0j, Hhat)
-    Yeq = (Y / Hhat[:, None])
+    # === Equalization ===
+    # In AWGN, the channel is (ideally) unity．Using a noisy pilot to form Hhat would inject the pilot noise
+    # into *all* symbols on that subcarrier．That behaves like a bursty error multiplier at low SNR．
+    # To get smooth performance vs SNR under AWGN, skip equalization entirely．
+    if cfg.chan.channel == "awgn":
+        Yeq = Y
+    else:
+        pilot_tx = X[:, 0]
+        denom = np.where(np.abs(pilot_tx) < 1e-12, 1.0+0j, pilot_tx)
+        Hhat = Y[:, 0] / denom
+        # regularize to avoid dividing by tiny noisy estimates
+        eps = 1e-3
+        Hhat = np.where(np.abs(Hhat) < eps, 1.0+0j, Hhat)
+        Yeq = (Y / Hhat[:, None])
 
     # --- decode per modality ---
     results = {}
