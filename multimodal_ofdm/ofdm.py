@@ -1,8 +1,7 @@
-
 from __future__ import annotations
 import numpy as np
 from typing import Dict, Tuple, List
-from .config import OfdmConfig
+from .config import OfdmConfig, LinkConfig
 from .utils import bytes_to_bits, bits_to_bytes, block_interleave, block_deinterleave, repeat_bits
 from . import hamming74 as ham
 
@@ -32,7 +31,7 @@ def make_subcarrier_slices(cfg: OfdmConfig, modalities: List[str]) -> Dict[str, 
 def assemble_grid(payload_per_mod: Dict[str, bytes],
                   header_per_mod: Dict[str, bytes],
                   cfg_ofdm: OfdmConfig,
-                  cfg_link,  # has interleaver_depth, header_rep_k
+                  cfg_link: LinkConfig,
                   power_linear_per_mod: Dict[str, float]) -> Tuple[np.ndarray, Dict[str, slice], Dict[str,int]]:
     """Return frequency-domain resource grid X[f, t] including one all-ones pilot at t=0.
     Also return modality->slice mapping and symbol counts per modality (data only)."""
@@ -42,7 +41,10 @@ def assemble_grid(payload_per_mod: Dict[str, bytes],
     # 1) Convert bytes -> bits -> Hamming -> interleave
     def _enc(b: bytes, rep_k: int) -> np.ndarray:
         bt = bytes_to_bits(b)
-        enc = ham.encode(bt)
+        if cfg_link.fec_enabled:
+            enc = ham.encode(bt)
+        else:
+            enc = bt
         if int(rep_k) > 1:
             enc = repeat_bits(enc, int(rep_k))
         inter = block_interleave(enc, cfg_link.interleaver_depth)
@@ -159,7 +161,10 @@ def decode_stream(hdr_bits: np.ndarray, pay_bits: np.ndarray, cfg_link, original
     from .utils import bits_to_bytes
     def _dec(b: np.ndarray, L: int) -> bytes:
         de = block_deinterleave(b, cfg_link.interleaver_depth)
-        d  = ham.decode(de)
+        if cfg_link.fec_enabled:
+            d  = ham.decode(de)
+        else:
+            d = de
         if len(d) > L: d = d[:L]
         return bits_to_bytes(d)
     return _dec(hdr_bits, original_bit_len_hdr), _dec(pay_bits, original_bit_len_pay)

@@ -32,6 +32,7 @@ class AppLayerConfig:
 @dataclass
 class LinkConfig:
     # FEC: Hamming(7,4) + block interleaver
+    fec_enabled: bool = True  # NEW: Flag to enable/disable FEC
     mtu_bytes: int = 256
     interleaver_depth: int = 256
     header_rep_k: int = 5

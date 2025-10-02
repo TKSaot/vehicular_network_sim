@@ -6,7 +6,8 @@ from PIL import Image
 from .config import ExperimentConfig
 from .application import (
     serialize_content, AppHeader, deserialize_content,
-    _build_seg_ids_and_palette, _suppress_white_boundaries, _load_image
+    _build_seg_ids_and_palette, _suppress_white_boundaries, _load_image,
+    _build_text_codebook, _POPCNT_9
 )
 from .utils import (
     bytes_to_bits, bits_to_bytes, append_crc32,
@@ -20,6 +21,29 @@ from .metrics import psnr, miou_from_ids, f1_binary_edge, ssim
 from .presets import POWER_PRESETS
 
 MODS = ["text","edge","depth","segmentation"]
+# Heuristic to validate parsed headers per modality (more realistic for TEXT where H/W=0).
+def _hdr_is_plausible(m: str, cand: AppHeader, exp_payload_len_bytes: int) -> bool:
+    try:
+        if cand is None: return False
+        if cand.modality != m: return False
+        if m == "text":
+            # Expect bits=8 or 9 and a sensible payload length near the TX length
+            if int(getattr(cand, "bits_per_sample", 0)) not in (8, 9): return False
+            P = int(getattr(cand, "payload_len_bytes", -1))
+            if P <= 0: return False
+            # Allow ±10%% tolerance to survive a few header bit errors that pass Hamming.
+            lo = int(0.9 * exp_payload_len_bytes)
+            hi = int(1.1 * exp_payload_len_bytes) + 8
+            return lo <= P <= hi
+        else:
+            # Images: need positive dims and a reasonable payload_len
+            H = int(getattr(cand, "height", 0)); W = int(getattr(cand, "width", 0))
+            if H <= 0 or W <= 0: return False
+            P = int(getattr(cand, "payload_len_bytes", -1))
+            if P <= 0: return False
+            return True
+    except Exception:
+        return False
 ZERO_MODS: set[str] = set()
 
 # ---------- helpers ----------
@@ -54,8 +78,9 @@ def _resolve_examples_dir(args_examples_dir: str | None) -> str:
     return os.path.join(repo_root, "examples")
 
 def _ecc_link_tag(cfg) -> str:
+    fec_tag = "FEC" if cfg.link.fec_enabled else "noFEC"
     rep = getattr(cfg.link, 'payload_rep_k', {})
-    return (f"linkH74_i{int(cfg.link.interleaver_depth)}_hdr{int(cfg.link.header_rep_k)}"
+    return (f"link_{fec_tag}_i{int(cfg.link.interleaver_depth)}_hdr{int(cfg.link.header_rep_k)}"
             f"_rep[t{int(rep.get('text',1))}e{int(rep.get('edge',1))}d{int(rep.get('depth',1))}s{int(rep.get('segmentation',1))}]"
             f"__map-{cfg.link.byte_mapping}")
 
@@ -71,7 +96,9 @@ def _after_interleave_len(n_bits_enc: int, depth: int) -> int:
     cols = int(math.ceil(float(n_bits_enc) / d))
     return d * cols
 
-def _ham_encoded_len(n_bits_raw: int) -> int:
+def _encoded_len(n_bits_raw: int, fec_enabled: bool) -> int:
+    if not fec_enabled:
+        return n_bits_raw
     return 7 * ((int(n_bits_raw) + 3) // 4)
 
 def _majority_bits(bit_arrays: list[np.ndarray]) -> np.ndarray:
@@ -101,6 +128,27 @@ def _estimate_snr_db_from_real(r: np.ndarray) -> float:
     if var <= 0: return 99.0
     snr = (mu * mu) / var
     return float(10.0 * np.log10(max(snr, 1e-12)))
+
+def _text_payload_score(payload_bytes: bytes, bits: int, symbols: str) -> int:
+    """Lower is better．Sum over bytes of Hamming distance to nearest valid codeword．"""
+    import numpy as _np
+    enc_map, chosen_codes, lut_idx = _build_text_codebook(symbols, bits)
+    if bits != 8:
+        # For 9-bit symbols we pack into bytes; just approximate by 8-bit distance on each byte.
+        arr = _np.frombuffer(payload_bytes, dtype=_np.uint8)
+        # Distance to nearest code in 8-bit space (proxy)
+        cc = _np.array(chosen_codes, dtype=_np.uint16) & 0xFF
+        x = (arr.astype(_np.uint16)[:, None] ^ cc[None, :]).astype(_np.int64)
+        # _POPCNT_9 supports up to 9-bit values (0..511)
+        d = _np.take(_POPCNT_9, x)
+        return int(_np.min(d, axis=1).sum())
+    else:
+        arr = _np.frombuffer(payload_bytes, dtype=_np.uint8)
+        cc = _np.array(chosen_codes, dtype=_np.uint16)
+        x = (arr.astype(_np.uint16)[:, None] ^ cc[None, :]).astype(_np.int64)
+        d = _np.take(_POPCNT_9, x)  # popcount lookup
+        return int(_np.min(d, axis=1).sum())
+
 
 # ---- image shape fixer ----
 def _fix_img_shape(arr: np.ndarray, H: int, W: int, ch3: bool) -> np.ndarray:
@@ -158,14 +206,15 @@ def main():
     ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None)
     ap.add_argument("--byte-seed", type=int, default=None)
     ap.add_argument("--payload-rep", type=str, default="")
+    ap.add_argument("--no-fec", action="store_true", help="Disable Hamming(7,4) FEC") # NEW
 
-    # NEW: RX “ECC” profiles / overrides (denoise/postproc)
+    # RX “ECC” profiles / overrides (denoise/postproc)
     ap.add_argument("--ecc-profile", type=str, choices=["none","rxstrong"], default=None)
     ap.add_argument("--edge-denoise", type=str, choices=["none","gentle","medium","strong"], default=None)
     ap.add_argument("--depth-denoise", type=str, choices=["none","median3","median5"], default=None)
     ap.add_argument("--seg-mode", type=str, choices=["none","majority3","majority5","strong"], default=None)
 
-    # NEW: metrics selection and guards
+    # metrics selection and guards
     ap.add_argument("--metrics", type=str, default="all", help="Comma list among: all|none|edge|depth|seg|text")
     ap.add_argument("--metrics-if-crc", action="store_true", help="Only compute metric if its CRC passed")
 
@@ -178,6 +227,7 @@ def main():
     if args.out_root is not None: cfg.paths.output_root = args.out_root
     if args.byte_mapping is not None: cfg.link.byte_mapping = args.byte_mapping
     if args.byte_seed is not None: cfg.link.byte_seed = int(args.byte_seed)
+    if args.no_fec: cfg.link.fec_enabled = False # NEW
     if args.payload_rep:
         cur = getattr(cfg.link, 'payload_rep_k', {}).copy()
         cur.update(_parse_kv_ints(args.payload_rep))
@@ -261,19 +311,16 @@ def main():
         H = np.ones(X.shape[0], dtype=np.complex128)
 
     # === Equalization ===
-    # In AWGN, the channel is (ideally) unity．Using a noisy pilot to form Hhat would inject the pilot noise
-    # into *all* symbols on that subcarrier．That behaves like a bursty error multiplier at low SNR．
-    # To get smooth performance vs SNR under AWGN, skip equalization entirely．
     if cfg.chan.channel == "awgn":
         Yeq = Y
     else:
         pilot_tx = X[:, 0]
         denom = np.where(np.abs(pilot_tx) < 1e-12, 1.0+0j, pilot_tx)
         Hhat = Y[:, 0] / denom
-        # regularize to avoid dividing by tiny noisy estimates
         eps = 1e-3
         Hhat = np.where(np.abs(Hhat) < eps, 1.0+0j, Hhat)
         Yeq = (Y / Hhat[:, None])
+
 
     # --- decode per modality ---
     results = {}
@@ -285,12 +332,12 @@ def main():
         D = cfg.link.interleaver_depth; Krep = cfg.link.header_rep_k
         rep_k = int(getattr(cfg.link, 'payload_rep_k', {}).get(m, 1))
 
-        L_hdr1 = _ham_encoded_len(L_hdr0)
+        L_hdr1 = _encoded_len(L_hdr0, cfg.link.fec_enabled)
         L_hdr2 = _after_interleave_len(L_hdr1, D)
         L_hdr3 = Krep * L_hdr2
         n_hdr_cols = int(math.ceil(L_hdr3 / per))
 
-        L_pay1 = _ham_encoded_len(L_pay0)
+        L_pay1 = _encoded_len(L_pay0, cfg.link.fec_enabled)
         L_pay1r = rep_k * L_pay1
         L_pay2 = _after_interleave_len(L_pay1r, D)
         n_pay_cols = int(math.ceil(L_pay2 / per))
@@ -305,7 +352,11 @@ def main():
                 if chunk.size < L_hdr2:
                     chunk = np.concatenate([chunk, np.zeros(L_hdr2 - chunk.size, dtype=np.uint8)])
                 d_inter = block_deinterleave(chunk, D, original_len=L_hdr1)
-                chunks.append(ham.decode(d_inter)[:L_hdr0])
+                if cfg.link.fec_enabled:
+                    decoded_chunk = ham.decode(d_inter)
+                else:
+                    decoded_chunk = d_inter
+                chunks.append(decoded_chunk[:L_hdr0])
             return _majority_bits(chunks)
 
         bC, bF = _flatten_bits_from_cols(hdr_cols, L_hdr3)
@@ -316,7 +367,7 @@ def main():
         for idx, hb in enumerate(hdr_bits_candidates):
             try:
                 cand = AppHeader.from_bytes(bits_to_bytes(hb))
-                if (cand.modality == m) and (cand.height > 0 and cand.width > 0):
+                if _hdr_is_plausible(m, cand, exp_payload_len_bytes=len(payloads[m]) - 4):
                     rx_hdr = cand; order_idx = idx; break
             except Exception:
                 pass
@@ -338,7 +389,10 @@ def main():
                 derep = derepeat_bits_majority(deinter, rep_k, original_len=L_pay1)
             else:
                 derep = deinter
-            dec = ham.decode(derep)[:L_pay0]
+            if cfg.link.fec_enabled:
+                dec = ham.decode(derep)[:L_pay0]
+            else:
+                dec = derep[:L_pay0]
             bb = bits_to_bytes(dec)
             return verify_and_strip_crc32(bb)
 
@@ -350,12 +404,23 @@ def main():
             if ok2:
                 ok_crc, payload_perm = ok2, payload2
                 order_idx = 1 - order_idx
-            # payload CRC still NG: fall back to original header dimensions for saving
-            if not ok_crc:
-                try:
-                    rx_hdr = AppHeader.from_bytes(hdrs[m])
-                except Exception:
-                    pass
+            else:
+                if m == "text":
+                    bits_ps = int(getattr(cfg.app, "text_bits_per_char", 8))
+                    symbols_ps = getattr(cfg.app, "text_symbols", "abcdefghijklmnopqrstuvwxyz1234567890, .\n")
+                    seed_m = derive_modality_seed(cfg.link.byte_seed, m) if cfg.link.byte_mapping == "permute" else None
+                    cand1 = unpermute_bytes(payload_perm, seed_m) if seed_m is not None else payload_perm
+                    cand2 = unpermute_bytes(payload2,     seed_m) if seed_m is not None else payload2
+                    s1 = _text_payload_score(cand1, bits=bits_ps, symbols=symbols_ps)
+                    s2 = _text_payload_score(cand2, bits=bits_ps, symbols=symbols_ps)
+                    if s2 < s1:
+                        payload_perm = payload2
+                        order_idx = 1 - order_idx
+                if not ok_crc:
+                    try:
+                        rx_hdr = AppHeader.from_bytes(hdrs[m])
+                    except Exception:
+                        pass
 
         r_pay = pay_cols.real.reshape(-1)
         snr_by_mod[m] = _estimate_snr_db_from_real(r_pay)
@@ -511,6 +576,7 @@ def main():
     report = {
         "snr_db": cfg.chan.snr_db,
         "channel": cfg.chan.channel,
+        "fec_enabled": cfg.link.fec_enabled,
         "ofdm": {"n_fft": cfg.ofdm.n_fft, "cp_len": cfg.ofdm.cp_len, "used_subcarriers": cfg.ofdm.used_subcarriers},
         "mode": mode.upper(),
         "power_linear": weights,
@@ -544,6 +610,7 @@ def main():
     print("=== Multimodal OFDM Report ===")
     print(f"Output dir: {out_dir}")
     print(f"SNR(dB): {cfg.chan.snr_db}  Channel: {cfg.chan.channel}")
+    print(f"FEC: {'Enabled' if cfg.link.fec_enabled else 'Disabled'}")
     print(f"Mode: {mode.upper()}  Power: {weights}  Preset: {preset_name or '-'}")
     print(f"Byte mapping: {cfg.link.byte_mapping} (seed={cfg.link.byte_seed})")
     print(f"Payload repetition k: {getattr(cfg.link, 'payload_rep_k', {})}")
