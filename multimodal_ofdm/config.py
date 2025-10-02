@@ -6,45 +6,34 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 
 @dataclass
 class AppLayerConfig:
-    # --- Text (TX/RX) ---
-    # Alphabet used by the robust text codec (order matters; include space if you want it preserved)
+    # ... (変更なし)
     text_symbols = "abcdefghijklmnopqrstuvwxyz1234567890, .\n"
-    # Bits per character for the robust text codec (8 now; 9 later if you expand the alphabet or want SEC capability)
     text_bits_per_char: int = 8
-    # Convert input text to lowercase before encoding (recommended for compact alphabets)
     text_casefold: bool = True
-
-    # --- Segmentation (RX) ---
     seg_white_thresh: int = 250
     seg_mode: Literal["none", "majority3", "majority5", "strong"] = "none"
     seg_iters: int = 2
-    seg_consensus_min_frac: float = 0.6  # majority confidence threshold
+    seg_consensus_min_frac: float = 0.6
     seg_seed: int = 123
-
-    # --- Edge (RX) ---
     edge_denoise: Literal["none", "gentle", "medium", "strong"] = "none"
     edge_iters: int = 1
-
-    # --- Depth (RX) ---
     depth_denoise: Literal["none", "median3", "median5"] = "none"
     depth_iters: int = 1
 
 @dataclass
 class LinkConfig:
-    # FEC: Hamming(7,4) + block interleaver
-    fec_enabled: bool = True  # NEW: Flag to enable/disable FEC
+    # ... (decoder_type, etc.)
+    fec_enabled: bool = True
+    decoder_type: Literal["hard", "soft"] = "hard"
     mtu_bytes: int = 256
     interleaver_depth: int = 256
     header_rep_k: int = 5
-    header_boost_db: float = 6.0
+    # MODIFIED: Removed header_boost_db as it is no longer used
+    # header_boost_db: float = 6.0
 
-    # Payload repetition per modality (outer code before interleaver).
-    # FAIR BASELINE: set all to 1 (no repetition) so power-allocation studies are not confounded.
     payload_rep_k: Dict[Modal, int] = field(default_factory=lambda: {
         'text': 1, 'edge': 1, 'depth': 1, 'segmentation': 1
     })
-
-    # --- Byte mapping (payload only) ---
     byte_mapping: Literal["none", "permute"] = "permute"
     byte_seed: int = 12345
 

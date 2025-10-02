@@ -3,6 +3,8 @@ import os, argparse, json, datetime, math
 import numpy as np
 from PIL import Image
 
+# MODIFIED: Import the hamming module directly to access both decoders
+from . import hamming74 as ham
 from .config import ExperimentConfig
 from .application import (
     serialize_content, AppHeader, deserialize_content,
@@ -79,8 +81,9 @@ def _resolve_examples_dir(args_examples_dir: str | None) -> str:
 
 def _ecc_link_tag(cfg) -> str:
     fec_tag = "FEC" if cfg.link.fec_enabled else "noFEC"
+    decoder_tag = cfg.link.decoder_type
     rep = getattr(cfg.link, 'payload_rep_k', {})
-    return (f"link_{fec_tag}_i{int(cfg.link.interleaver_depth)}_hdr{int(cfg.link.header_rep_k)}"
+    return (f"link_{fec_tag}-{decoder_tag}_i{int(cfg.link.interleaver_depth)}_hdr{int(cfg.link.header_rep_k)}"
             f"_rep[t{int(rep.get('text',1))}e{int(rep.get('edge',1))}d{int(rep.get('depth',1))}s{int(rep.get('segmentation',1))}]"
             f"__map-{cfg.link.byte_mapping}")
 
@@ -109,13 +112,28 @@ def _majority_bits(bit_arrays: list[np.ndarray]) -> np.ndarray:
     s = np.sum(M, axis=0)
     return (s >= (M.shape[0]//2 + 1)).astype(np.uint8)
 
-def _flatten_bits_from_cols(cols_complex: np.ndarray, n_need: int) -> tuple[np.ndarray, np.ndarray]:
+def _average_soft(soft_arrays: list[np.ndarray]) -> np.ndarray:
+    if not soft_arrays: return np.zeros(0, dtype=np.float32)
+    L = min(len(s) for s in soft_arrays)
+    if L == 0: return np.zeros(0, dtype=np.float32)
+    M = np.stack([s[:L] for s in soft_arrays], axis=0)
+    return np.mean(M, axis=0)
+
+def _flatten_hard_from_cols(cols_complex: np.ndarray, n_need: int) -> tuple[np.ndarray, np.ndarray]:
     R = cols_complex.real
     bC = (R.reshape(-1) >= 0).astype(np.uint8)[:n_need]
     bF = (R.T.reshape(-1) >= 0).astype(np.uint8)[:n_need]
     if bC.size < n_need: bC = np.pad(bC, (0, n_need - bC.size))
     if bF.size < n_need: bF = np.pad(bF, (0, n_need - bF.size))
     return bC, bF
+
+def _flatten_soft_from_cols(cols_complex: np.ndarray, n_need: int) -> tuple[np.ndarray, np.ndarray]:
+    R = cols_complex.real
+    sC = R.reshape(-1).astype(np.float32, copy=False)[:n_need]
+    sF = R.T.reshape(-1).astype(np.float32, copy=False)[:n_need]
+    if sC.size < n_need: sC = np.pad(sC, (0, n_need - sC.size))
+    if sF.size < n_need: sF = np.pad(sF, (0, n_need - sF.size))
+    return sC, sF
 
 def _estimate_snr_db_from_real(r: np.ndarray) -> float:
     r = np.asarray(r, dtype=np.float64).reshape(-1)
@@ -130,27 +148,21 @@ def _estimate_snr_db_from_real(r: np.ndarray) -> float:
     return float(10.0 * np.log10(max(snr, 1e-12)))
 
 def _text_payload_score(payload_bytes: bytes, bits: int, symbols: str) -> int:
-    """Lower is better．Sum over bytes of Hamming distance to nearest valid codeword．"""
     import numpy as _np
     enc_map, chosen_codes, lut_idx = _build_text_codebook(symbols, bits)
     if bits != 8:
-        # For 9-bit symbols we pack into bytes; just approximate by 8-bit distance on each byte.
         arr = _np.frombuffer(payload_bytes, dtype=_np.uint8)
-        # Distance to nearest code in 8-bit space (proxy)
         cc = _np.array(chosen_codes, dtype=_np.uint16) & 0xFF
         x = (arr.astype(_np.uint16)[:, None] ^ cc[None, :]).astype(_np.int64)
-        # _POPCNT_9 supports up to 9-bit values (0..511)
         d = _np.take(_POPCNT_9, x)
         return int(_np.min(d, axis=1).sum())
     else:
         arr = _np.frombuffer(payload_bytes, dtype=_np.uint8)
         cc = _np.array(chosen_codes, dtype=_np.uint16)
         x = (arr.astype(_np.uint16)[:, None] ^ cc[None, :]).astype(_np.int64)
-        d = _np.take(_POPCNT_9, x)  # popcount lookup
+        d = _np.take(_POPCNT_9, x)
         return int(_np.min(d, axis=1).sum())
 
-
-# ---- image shape fixer ----
 def _fix_img_shape(arr: np.ndarray, H: int, W: int, ch3: bool) -> np.ndarray:
     a = np.asarray(arr)
     H = max(1,int(H)); W = max(1,int(W))
@@ -171,15 +183,12 @@ def _fix_img_shape(arr: np.ndarray, H: int, W: int, ch3: bool) -> np.ndarray:
         if flat.size < need: flat = np.pad(flat, (0, need - flat.size))
         return flat[:need].reshape(H, W).astype(np.uint8, copy=False)
 
-# ---- memory-safe palette mapping for segmentation ----
-def _ids_from_rgb_nearest_palette(rx_rgb_u8: np.ndarray, palette_u8: np.ndarray,
-                                  max_bytes: int = 200_000_000) -> np.ndarray:
+def _ids_from_rgb_nearest_palette(rx_rgb_u8: np.ndarray, palette_u8: np.ndarray, max_bytes: int = 200_000_000) -> np.ndarray:
     rx = rx_rgb_u8.reshape(-1, 3).astype(np.float32, copy=False)
     pal = palette_u8.astype(np.float32, copy=False)
     N, K = rx.shape[0], pal.shape[0]
     if K <= 0 or N <= 0:
         return np.zeros((rx_rgb_u8.shape[0], rx_rgb_u8.shape[1]), dtype=np.int64)
-    # choose chunk size to respect memory budget: bytes ~ chunk * K * 4
     chunk = max(1, min(N, int(max_bytes // (max(K,1) * 4))))
     out = np.empty(N, dtype=np.int64)
     for start in range(0, N, chunk):
@@ -190,7 +199,6 @@ def _ids_from_rgb_nearest_palette(rx_rgb_u8: np.ndarray, palette_u8: np.ndarray,
     H, W = rx_rgb_u8.shape[:2]
     return out.reshape(H, W)
 
-# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snr_db", type=float, default=None)
@@ -206,34 +214,30 @@ def main():
     ap.add_argument("--byte-mapping", type=str, choices=["none","permute"], default=None)
     ap.add_argument("--byte-seed", type=int, default=None)
     ap.add_argument("--payload-rep", type=str, default="")
-    ap.add_argument("--no-fec", action="store_true", help="Disable Hamming(7,4) FEC") # NEW
-
-    # RX “ECC” profiles / overrides (denoise/postproc)
+    ap.add_argument("--no-fec", action="store_true", help="Disable Hamming(7,4) FEC")
+    ap.add_argument("--decoder-type", type=str, choices=["hard", "soft"], default=None, help="Type of FEC decoder to use")
     ap.add_argument("--ecc-profile", type=str, choices=["none","rxstrong"], default=None)
     ap.add_argument("--edge-denoise", type=str, choices=["none","gentle","medium","strong"], default=None)
     ap.add_argument("--depth-denoise", type=str, choices=["none","median3","median5"], default=None)
     ap.add_argument("--seg-mode", type=str, choices=["none","majority3","majority5","strong"], default=None)
-
-    # metrics selection and guards
     ap.add_argument("--metrics", type=str, default="all", help="Comma list among: all|none|edge|depth|seg|text")
     ap.add_argument("--metrics-if-crc", action="store_true", help="Only compute metric if its CRC passed")
-
     args = ap.parse_args()
 
-    # --- config ---
     cfg = ExperimentConfig()
     if args.snr_db is not None: cfg.chan.snr_db = float(args.snr_db)
     if args.channel is not None: cfg.chan.channel = args.channel
     if args.out_root is not None: cfg.paths.output_root = args.out_root
     if args.byte_mapping is not None: cfg.link.byte_mapping = args.byte_mapping
     if args.byte_seed is not None: cfg.link.byte_seed = int(args.byte_seed)
-    if args.no_fec: cfg.link.fec_enabled = False # NEW
+    if args.no_fec: cfg.link.fec_enabled = False
+    if args.decoder_type is not None:
+        cfg.link.decoder_type = args.decoder_type
     if args.payload_rep:
         cur = getattr(cfg.link, 'payload_rep_k', {}).copy()
         cur.update(_parse_kv_ints(args.payload_rep))
         cfg.link.payload_rep_k = cur
 
-    # Apply RX profile
     if args.ecc_profile == "none":
         cfg.app.edge_denoise = "none"
         cfg.app.depth_denoise = "none"
@@ -242,12 +246,10 @@ def main():
         cfg.app.edge_denoise = "strong"
         cfg.app.depth_denoise = "median5"
         cfg.app.seg_mode = "strong"
-    # explicit overrides win
     if args.edge_denoise is not None: cfg.app.edge_denoise = args.edge_denoise
     if args.depth_denoise is not None: cfg.app.depth_denoise = args.depth_denoise
     if args.seg_mode is not None: cfg.app.seg_mode = args.seg_mode
 
-    # inputs
     examples_dir = _resolve_examples_dir(args.examples_dir)
     input_paths = {
         "text": os.path.join(examples_dir, "sample.txt"),
@@ -288,7 +290,6 @@ def main():
         preset_name = key
         mode = "eep" if key == "eep" else "uep"
 
-    # normalize weights so sum == len(MODS)
     s = sum(weights.values()); weights = {k: v*len(MODS)/s for k,v in weights.items()}
     ZERO_MODS.clear()
     for m,w in weights.items():
@@ -310,7 +311,6 @@ def main():
                       n_fft=cfg.ofdm.n_fft, cp_len=cfg.ofdm.cp_len)
         H = np.ones(X.shape[0], dtype=np.complex128)
 
-    # === Equalization ===
     if cfg.chan.channel == "awgn":
         Yeq = Y
     else:
@@ -321,7 +321,7 @@ def main():
         Hhat = np.where(np.abs(Hhat) < eps, 1.0+0j, Hhat)
         Yeq = (Y / Hhat[:, None])
 
-
+    # ALL SUBSEQUENT CODE IS NOW CORRECTLY INDENTED TO BE PART OF main()
     # --- decode per modality ---
     results = {}
     snr_by_mod = {}
@@ -343,24 +343,42 @@ def main():
         n_pay_cols = int(math.ceil(L_pay2 / per))
 
         hdr_cols = Yeq[sl, 1:1+n_hdr_cols]
-        def _try_decode_hdr(bits_flat: np.ndarray) -> np.ndarray:
-            from . import hamming74 as ham
-            chunks = []
-            for i in range(Krep):
-                start, end = i*L_hdr2, min((i+1)*L_hdr2, bits_flat.size)
-                chunk = bits_flat[start:end]
-                if chunk.size < L_hdr2:
-                    chunk = np.concatenate([chunk, np.zeros(L_hdr2 - chunk.size, dtype=np.uint8)])
-                d_inter = block_deinterleave(chunk, D, original_len=L_hdr1)
-                if cfg.link.fec_enabled:
-                    decoded_chunk = ham.decode(d_inter)
-                else:
-                    decoded_chunk = d_inter
-                chunks.append(decoded_chunk[:L_hdr0])
-            return _majority_bits(chunks)
 
-        bC, bF = _flatten_bits_from_cols(hdr_cols, L_hdr3)
-        hdr_bits_candidates = [ _try_decode_hdr(bC), _try_decode_hdr(bF) ]
+        if cfg.link.decoder_type == 'soft' and cfg.link.fec_enabled:
+            def _try_decode_hdr(soft_flat: np.ndarray) -> np.ndarray:
+                chunks = []
+                for i in range(Krep):
+                    start, end = i*L_hdr2, min((i+1)*L_hdr2, soft_flat.size)
+                    chunk = soft_flat[start:end]
+                    if chunk.size < L_hdr2:
+                        chunk = np.pad(chunk, (0, L_hdr2 - chunk.size))
+                    chunks.append(chunk)
+                
+                avg_soft_chunk = _average_soft(chunks)
+                d_inter = block_deinterleave(avg_soft_chunk, D, original_len=L_hdr1)
+                decoded_bits = ham.decode_soft(d_inter)
+                return decoded_bits[:L_hdr0]
+
+            sC, sF = _flatten_soft_from_cols(hdr_cols, L_hdr3)
+            hdr_bits_candidates = [_try_decode_hdr(sC), _try_decode_hdr(sF)]
+        else:
+            def _try_decode_hdr(bits_flat: np.ndarray) -> np.ndarray:
+                chunks = []
+                for i in range(Krep):
+                    start, end = i*L_hdr2, min((i+1)*L_hdr2, bits_flat.size)
+                    chunk = bits_flat[start:end]
+                    if chunk.size < L_hdr2:
+                        chunk = np.pad(chunk, (0, L_hdr2 - chunk.size), 'constant')
+                    d_inter = block_deinterleave(chunk, D, original_len=L_hdr1)
+                    if cfg.link.fec_enabled:
+                        decoded_chunk = ham.decode(d_inter)
+                    else:
+                        decoded_chunk = d_inter
+                    chunks.append(decoded_chunk[:L_hdr0])
+                return _majority_bits(chunks)
+            
+            bC, bF = _flatten_hard_from_cols(hdr_cols, L_hdr3)
+            hdr_bits_candidates = [_try_decode_hdr(bC), _try_decode_hdr(bF)]
 
         order_idx = 0
         rx_hdr = None
@@ -381,46 +399,71 @@ def main():
             rx_hdr = AppHeader.from_bytes(hdrs[m])
 
         pay_cols = Yeq[sl, 1+n_hdr_cols : 1+n_hdr_cols+n_pay_cols]
-        bC_pay, bF_pay = _flatten_bits_from_cols(pay_cols, L_pay2)
-        from . import hamming74 as ham
-        def _decode_payload(bits_in: np.ndarray) -> tuple[bool, bytes]:
-            deinter = block_deinterleave(bits_in, D, original_len=L_pay1r)
-            if rep_k > 1:
-                derep = derepeat_bits_majority(deinter, rep_k, original_len=L_pay1)
-            else:
-                derep = deinter
-            if cfg.link.fec_enabled:
-                dec = ham.decode(derep)[:L_pay0]
-            else:
-                dec = derep[:L_pay0]
-            bb = bits_to_bytes(dec)
-            return verify_and_strip_crc32(bb)
+        
+        # Initialize payload2 for later fallback logic
+        payload2 = b''
+        
+        if cfg.link.decoder_type == 'soft' and cfg.link.fec_enabled:
+            def _decode_payload_soft(soft_in: np.ndarray) -> tuple[bool, bytes]:
+                deinter = block_deinterleave(soft_in, D, original_len=L_pay1r)
+                if rep_k > 1:
+                    reshaped = deinter.reshape(-1, rep_k)
+                    averaged = np.mean(reshaped, axis=1)
+                    derep = averaged
+                else:
+                    derep = deinter
+                dec = ham.decode_soft(derep)[:L_pay0]
+                bb = bits_to_bytes(dec)
+                return verify_and_strip_crc32(bb)
 
-        first = (bC_pay if order_idx == 0 else bF_pay)
-        ok_crc, payload_perm = _decode_payload(first)
+            sC_pay, sF_pay = _flatten_soft_from_cols(pay_cols, L_pay2)
+            first, other = (sC_pay, sF_pay) if order_idx == 0 else (sF_pay, sC_pay)
+            ok_crc, payload_perm = _decode_payload_soft(first)
+            if not ok_crc:
+                ok2, payload2 = _decode_payload_soft(other)
+                if ok2:
+                    ok_crc, payload_perm = ok2, payload2
+                    order_idx = 1 - order_idx
+        else:
+            def _decode_payload_hard(bits_in: np.ndarray) -> tuple[bool, bytes]:
+                deinter = block_deinterleave(bits_in, D, original_len=L_pay1r)
+                if rep_k > 1:
+                    derep = derepeat_bits_majority(deinter, rep_k, original_len=L_pay1)
+                else:
+                    derep = deinter
+                if cfg.link.fec_enabled:
+                    dec = ham.decode(derep)[:L_pay0]
+                else:
+                    dec = derep[:L_pay0]
+                bb = bits_to_bytes(dec)
+                return verify_and_strip_crc32(bb)
+
+            bC_pay, bF_pay = _flatten_hard_from_cols(pay_cols, L_pay2)
+            first, other = (bC_pay, bF_pay) if order_idx == 0 else (bF_pay, bC_pay)
+            ok_crc, payload_perm = _decode_payload_hard(first)
+            if not ok_crc:
+                ok2, payload2 = _decode_payload_hard(other)
+                if ok2:
+                    ok_crc, payload_perm = ok2, payload2
+                    order_idx = 1 - order_idx
+        
         if not ok_crc:
-            other = (bF_pay if order_idx == 0 else bC_pay)
-            ok2, payload2 = _decode_payload(other)
-            if ok2:
-                ok_crc, payload_perm = ok2, payload2
-                order_idx = 1 - order_idx
-            else:
-                if m == "text":
-                    bits_ps = int(getattr(cfg.app, "text_bits_per_char", 8))
-                    symbols_ps = getattr(cfg.app, "text_symbols", "abcdefghijklmnopqrstuvwxyz1234567890, .\n")
-                    seed_m = derive_modality_seed(cfg.link.byte_seed, m) if cfg.link.byte_mapping == "permute" else None
-                    cand1 = unpermute_bytes(payload_perm, seed_m) if seed_m is not None else payload_perm
-                    cand2 = unpermute_bytes(payload2,     seed_m) if seed_m is not None else payload2
-                    s1 = _text_payload_score(cand1, bits=bits_ps, symbols=symbols_ps)
-                    s2 = _text_payload_score(cand2, bits=bits_ps, symbols=symbols_ps)
-                    if s2 < s1:
-                        payload_perm = payload2
-                        order_idx = 1 - order_idx
-                if not ok_crc:
-                    try:
-                        rx_hdr = AppHeader.from_bytes(hdrs[m])
-                    except Exception:
-                        pass
+            if m == "text":
+                bits_ps = int(getattr(cfg.app, "text_bits_per_char", 8))
+                symbols_ps = getattr(cfg.app, "text_symbols", "abcdefghijklmnopqrstuvwxyz1234567890, .\n")
+                seed_m = derive_modality_seed(cfg.link.byte_seed, m) if cfg.link.byte_mapping == "permute" else None
+                cand1 = unpermute_bytes(payload_perm, seed_m) if seed_m is not None else payload_perm
+                cand2 = unpermute_bytes(payload2,     seed_m) if seed_m is not None else payload2
+                s1 = _text_payload_score(cand1, bits=bits_ps, symbols=symbols_ps)
+                s2 = _text_payload_score(cand2, bits=bits_ps, symbols=symbols_ps)
+                if s2 < s1:
+                    payload_perm = payload2
+                    order_idx = 1 - order_idx
+            if not ok_crc:
+                try:
+                    rx_hdr = AppHeader.from_bytes(hdrs[m])
+                except Exception:
+                    pass
 
         r_pay = pay_cols.real.reshape(-1)
         snr_by_mod[m] = _estimate_snr_db_from_real(r_pay)
@@ -511,7 +554,6 @@ def main():
     metrics = {}
     metric_errors = {}
 
-    # Edge
     try:
         if ("edge" in metric_flags) and (not args.metrics_if_crc or results["edge"]["crc_ok"]):
             e_gt = (_load_image(input_paths["edge"], "L") >= 128).astype(np.uint8) * 255
@@ -523,7 +565,6 @@ def main():
     except Exception as ex:
         metric_errors["edge"] = str(ex); metrics["edge_f1"] = None; metrics["edge_ssim"] = None
 
-    # Depth
     try:
         if ("depth" in metric_flags) and (not args.metrics_if_crc or results["depth"]["crc_ok"]):
             d_gt = _load_image(input_paths["depth"], "L").astype(np.uint8)
@@ -535,7 +576,6 @@ def main():
     except Exception as ex:
         metric_errors["depth"] = str(ex); metrics["depth_psnr"] = None; metrics["depth_ssim"] = None
 
-    # Segmentation
     try:
         if ("seg" in metric_flags) and (not args.metrics_if_crc or results["segmentation"]["crc_ok"]):
             seg_rgb_true = _suppress_white_boundaries(_load_image(input_paths["segmentation"], "RGB"),
@@ -557,7 +597,6 @@ def main():
     except Exception as ex:
         metric_errors["seg"] = str(ex); metrics["seg_mIoU"] = None
 
-    # Text
     try:
         if ("text" in metric_flags) and (not args.metrics_if_crc or results["text"]["crc_ok"]):
             with open(input_paths["text"], "r", encoding="utf-8") as f:
@@ -577,6 +616,7 @@ def main():
         "snr_db": cfg.chan.snr_db,
         "channel": cfg.chan.channel,
         "fec_enabled": cfg.link.fec_enabled,
+        "decoder_type": cfg.link.decoder_type,
         "ofdm": {"n_fft": cfg.ofdm.n_fft, "cp_len": cfg.ofdm.cp_len, "used_subcarriers": cfg.ofdm.used_subcarriers},
         "mode": mode.upper(),
         "power_linear": weights,
@@ -606,11 +646,10 @@ def main():
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # --- console summary ---
     print("=== Multimodal OFDM Report ===")
     print(f"Output dir: {out_dir}")
     print(f"SNR(dB): {cfg.chan.snr_db}  Channel: {cfg.chan.channel}")
-    print(f"FEC: {'Enabled' if cfg.link.fec_enabled else 'Disabled'}")
+    print(f"FEC: {'Enabled' if cfg.link.fec_enabled else 'Disabled'} (Decoder: {cfg.link.decoder_type})")
     print(f"Mode: {mode.upper()}  Power: {weights}  Preset: {preset_name or '-'}")
     print(f"Byte mapping: {cfg.link.byte_mapping} (seed={cfg.link.byte_seed})")
     print(f"Payload repetition k: {getattr(cfg.link, 'payload_rep_k', {})}")

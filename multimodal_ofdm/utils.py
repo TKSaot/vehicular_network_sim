@@ -101,7 +101,9 @@ def derepeat_bits_majority(bits: np.ndarray, k: int, original_len: int | None = 
     s = M.sum(axis=1)
     out = (s >= thr).astype(np.uint8)
     return out[:original_len] if original_len is not None else out
+    
 # ----------------- Interleaving -----------------
+# MODIFIED: Removed dtype=np.uint8 to preserve input dtype (e.g., float32 for soft values)
 def block_interleave(bits: np.ndarray, depth: int) -> np.ndarray:
     """
     Simple block interleaver: write row-wise [depth x cols], read column-wise.
@@ -109,17 +111,18 @@ def block_interleave(bits: np.ndarray, depth: int) -> np.ndarray:
     """
     depth = max(1, int(depth))
     if depth == 1:
-        return np.asarray(bits, dtype=np.uint8).reshape(-1)
-    b = np.asarray(bits, dtype=np.uint8).reshape(-1)
+        return np.asarray(bits).reshape(-1)
+    b = np.asarray(bits).reshape(-1) # MODIFIED
     L = len(b)
     cols = int(np.ceil(L / depth))
     pad = depth * cols - L
     if pad:
-        b = np.concatenate([b, np.zeros(pad, dtype=np.uint8)])
+        b = np.concatenate([b, np.zeros(pad, dtype=b.dtype)]) # Use original dtype for padding
     mat = b.reshape(depth, cols)
     out = mat.T.reshape(-1)
     return out
 
+# MODIFIED: Removed dtype=np.uint8 to preserve input dtype (e.g., float32 for soft values)
 def block_deinterleave(
     bits: np.ndarray,
     depth: int,
@@ -135,7 +138,7 @@ def block_deinterleave(
     Lout = original_len if original_len is not None else original_len_bits
 
     depth = max(1, int(depth))
-    b = np.asarray(bits, dtype=np.uint8).reshape(-1)
+    b = np.asarray(bits).reshape(-1) # MODIFIED
     if depth == 1:
         return b[:Lout] if Lout is not None else b
 
@@ -146,7 +149,7 @@ def block_deinterleave(
     cols = int(np.ceil(L / depth))
     need = cols * depth - L
     if need > 0:
-        b = np.concatenate([b, np.zeros(need, dtype=np.uint8)])
+        b = np.concatenate([b, np.zeros(need, dtype=b.dtype)]) # Use original dtype for padding
 
     mat = b.reshape(cols, depth).T
     out = mat.reshape(-1)
