@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Literal
 
@@ -7,14 +8,10 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 # MODIFIED: LlmConfig now directly controls the feature
 @dataclass
 class LlmConfig:
-    # --- Gemini API Settings ---
-    # To enable text correction, change this to True
-    correction_enabled: bool = False
-    
-    # IMPORTANT: Replace "YOUR_GEMINI_API_KEY" with your actual Gemini API key
-    api_key: str = "AIzaSyD6TkWGsxTH2NMNxvQ2HEsXZhE5IUKtaR8"
-    # The model to use for correction
-    model_name: str = "gemini-1.5-flash-latest"
+    correction_enabled: bool = True
+    # 環境変数からAPIキーを読み込む
+    api_key: str = os.getenv("OPENAI_API_KEY") 
+    model_name: str = "gpt-3.5-turbo"
 
 
 @dataclass
@@ -43,7 +40,7 @@ class AppLayerConfig:
 class LinkConfig:
     # --- FEC / Decoder ---
     fec_enabled: bool = True
-    decoder_type: Literal["hard", "soft"] = "hard"
+    decoder_type: Literal["hard", "soft"] = "soft"
     mtu_bytes: int = 256
     interleaver_depth: int = 256
     header_rep_k: int = 5
