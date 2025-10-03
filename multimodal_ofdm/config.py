@@ -6,6 +6,7 @@ from typing import Dict, Literal
 Modal = Literal["text", "edge", "depth", "segmentation"]
 
 # MODIFIED: LlmConfig now directly controls the feature
+# config.py
 @dataclass
 class LlmConfig:
     correction_enabled: bool = True
