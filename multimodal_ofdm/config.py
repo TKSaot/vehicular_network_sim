@@ -10,6 +10,7 @@ Modal = Literal["text", "edge", "depth", "segmentation"]
 @dataclass
 class LlmConfig:
     correction_enabled: bool = True
+    
     # 環境変数からAPIキーを読み込む
     api_key: str = os.getenv("OPENAI_API_KEY") 
     model_name: str = "gpt-3.5-turbo"
